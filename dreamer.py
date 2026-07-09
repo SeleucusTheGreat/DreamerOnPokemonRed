@@ -1,0 +1,1789 @@
+import os
+import glob
+import copy  # noqa: F401
+import time
+import queue
+import threading
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Independent, kl_divergence, OneHotCategoricalStraightThrough, OneHotCategorical
+from torch.distributions.utils import probs_to_logits
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+from PokemonRedEnv import (LTM_REWARD_DIM, MAP_CLASS_DIM, MAP_CLASS_TABLE, MAP_CLASS_INDEX,
+                           GRID_DIM, GRID_CENTER_INDEX, MAP_NAMES)
+
+IMAGE_SIZE = 64
+
+torch.set_float32_matmul_precision('high')
+
+
+def symlog(x):
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+
+def _mlp2(in_dim, out_dim, hidden=1024, act=nn.ELU, norm_out=True):
+    """Two-layer MLP (one hidden layer). `hidden` controls the MLP width."""
+    layers = [nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), act(), nn.Linear(hidden, out_dim)]
+    if norm_out:
+        layers.append(nn.LayerNorm(out_dim))
+    return nn.Sequential(*layers)
+
+
+def _mlp3(in_dim, out_dim, hidden=1024, act=nn.SiLU):
+    """Three-hidden-layer MLP (four Linear layers). `hidden` controls the MLP width."""
+    d = hidden
+    return nn.Sequential(
+        nn.Linear(in_dim, d), nn.LayerNorm(d), act(),
+        nn.Linear(d, d), nn.LayerNorm(d), act(),
+        nn.Linear(d, d), nn.LayerNorm(d), act(),
+        nn.Linear(d, out_dim),
+    )
+
+
+# ==========================================================
+# SCALAR ENCODINGS
+# ==========================================================
+class TwoHotEncoding:
+    """Symlog two-hot encoding (DreamerV3) for value/reward estimation."""
+    def __init__(self, min=-10, max=10, num_bins=255, device="cuda"):
+        self.device = device
+        self.num_bins = num_bins
+        self.bins = torch.linspace(min, max, num_bins, device=device)
+        self.bin_values = symexp(self.bins)
+
+    def encode(self, x):
+        x = symlog(x)
+        x = torch.clamp(x, self.bins[0], self.bins[-1])
+        pos = (x - self.bins[0]) / (self.bins[1] - self.bins[0])
+        low = torch.clamp(torch.floor(pos).long(), 0, self.num_bins - 2)
+        high = low + 1
+        weight_high = pos - low
+        weight_low = 1.0 - weight_high
+        two_hot = torch.zeros(*x.shape, self.num_bins, device=self.device)
+        two_hot.scatter_(-1, low.unsqueeze(-1), weight_low.unsqueeze(-1))
+        two_hot.scatter_(-1, high.unsqueeze(-1), weight_high.unsqueeze(-1))
+        return two_hot
+
+    def decode(self, logits):
+        probs = torch.softmax(logits, dim=-1)
+        return torch.sum(probs * self.bin_values, dim=-1, keepdim=True)
+
+
+# ==========================================================
+# IMAGE ENCODER / DECODER
+# ==========================================================
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, channels),  # LayerNorm equivalent for images
+            nn.ELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, channels),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class EncoderImage(nn.Module):
+    def __init__(self, output_size=1024, depth=32):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(3, depth, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth),                 # 64 -> 32
+            nn.Conv2d(depth, depth * 2, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth * 2),     # 32 -> 16
+            nn.Conv2d(depth * 2, depth * 4, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth * 4), # 16 -> 8
+            nn.Conv2d(depth * 4, depth * 8, kernel_size=4, stride=2, padding=1), nn.ELU(),                      # 8 -> 4
+            nn.Flatten(),
+            nn.Linear(depth * 8 * 4 * 4, output_size),
+            nn.LayerNorm(output_size),
+        )
+        # Lay the conv stack out for channels_last so cuDNN picks its fast kernels.
+        self.layers = self.layers.to(memory_format=torch.channels_last)
+
+    def forward(self, x):
+        # Match input layout to the weights (no-op on CPU, faster convs on CUDA).
+        x = x.contiguous(memory_format=torch.channels_last)
+        return self.layers(x)
+
+
+class Decoder(nn.Module):
+    """Visualization decoder (trained separately on detached states)."""
+    def __init__(self, input_size, depth=32):
+        super().__init__()
+        self.depth = depth
+        self.linear = nn.Linear(input_size, depth * 8 * 4 * 4)
+        self.net = nn.Sequential(
+            ResBlock(depth * 8),
+            nn.ConvTranspose2d(depth * 8, depth * 4, 4, stride=2, padding=1), nn.ELU(),  # 4 -> 8
+            ResBlock(depth * 4),
+            nn.ConvTranspose2d(depth * 4, depth * 2, 4, stride=2, padding=1), nn.ELU(),  # 8 -> 16
+            ResBlock(depth * 2),
+            nn.ConvTranspose2d(depth * 2, depth, 4, stride=2, padding=1), nn.ELU(),      # 16 -> 32
+            nn.ConvTranspose2d(depth, 3, 4, stride=2, padding=1),                        # 32 -> 64
+        )
+        self.net = self.net.to(memory_format=torch.channels_last)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = x.view(-1, self.depth * 8, 4, 4)
+        x = x.contiguous(memory_format=torch.channels_last)
+        return self.net(x)
+
+
+# ==========================================================
+# AUXILIARY ENCODERS (state -> feature) AND PREDICTORS (latent -> state)
+# ==========================================================
+class TeamItemEncoder(nn.Module):
+    """Combined party-levels + item-counts encoder (single encoder, feature #3)."""
+    def __init__(self, in_dim=8, out_dim=256, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(in_dim, out_dim, hidden=hidden)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TeamItemPredictor(nn.Module):
+    """Combined party-levels + item-counts predictor (single decoder, feature #3)."""
+    def __init__(self, input_size, out_dim=8, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(input_size, out_dim, hidden=hidden, act=nn.SiLU, norm_out=False)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LongTermMemoryEncoder(nn.Module):
+    """Whole-game long-term reward-memory (event flags) encoder (feature #2)."""
+    def __init__(self, in_dim=LTM_REWARD_DIM, out_dim=512, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(in_dim, out_dim, hidden=hidden)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class LongTermMemoryPredictor(nn.Module):
+    """Whole-game long-term reward-memory predictor (multi-label logits)."""
+    def __init__(self, input_size, out_dim=LTM_REWARD_DIM, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(input_size, out_dim, hidden=hidden, act=nn.SiLU, norm_out=False)
+        # Init flags off so nothing is hallucinated initially.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, -5.0)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MapClassEncoder(nn.Module):
+    """Encodes the current map into its one-hot category vector
+    [generic, key, special] (via a fixed lookup table over the 256 map ids) and
+    projects it to features. Input is the raw map id(s)."""
+    def __init__(self, out_dim=256, hidden=1024, class_dim=MAP_CLASS_DIM):
+        super().__init__()
+        self.net = _mlp2(class_dim, out_dim, hidden=hidden)
+        self.register_buffer("class_table", torch.from_numpy(MAP_CLASS_TABLE).float())
+
+    def forward(self, map_ids):
+        # map_ids: [..., 1] or [...]; look up its one-hot category row, then MLP.
+        idx = map_ids.long().reshape(-1)
+        return self.net(self.class_table[idx])
+
+
+class MapClassPredictor(nn.Module):
+    """Predicts the current map's category (generic / key / special) from the
+    latent state as 3-way logits (decoder for the map-class state component)."""
+    def __init__(self, input_size, class_dim=MAP_CLASS_DIM, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(input_size, class_dim, hidden=hidden, act=nn.SiLU, norm_out=False)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class GridEncoder(nn.Module):
+    """Local 5x5 explored-grid encoder (agent-centered exploration map, feature #grid)."""
+    def __init__(self, in_dim=GRID_DIM, out_dim=128, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(in_dim, out_dim, hidden=hidden)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class GridPredictor(nn.Module):
+    """Local 5x5 explored-grid predictor; the dream gates tile curiosity on its
+    CENTER cell (last layer zero-init so every cell starts at p=0.5)."""
+    def __init__(self, input_size, out_dim=GRID_DIM, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(input_size, out_dim, hidden=hidden, act=nn.SiLU, norm_out=False)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ==========================================================
+# REWARD / CURIOSITY HEADS
+# ==========================================================
+class RewardPredictor(nn.Module):
+    def __init__(self, inputsize, num_bins=255, mlp_dim=1024):
+        super().__init__()
+        self.transform = _mlp3(inputsize, num_bins, hidden=mlp_dim, act=nn.SiLU)
+        nn.init.zeros_(self.transform[-1].weight)
+        nn.init.zeros_(self.transform[-1].bias)
+
+    def forward(self, x):
+        return self.transform(x)
+
+
+class CuriosityPredictor(nn.Module):
+    """Learned curiosity head (two hidden layers); biased toward 0 at init."""
+    def __init__(self, input_size, num_bins=255, mlp_dim=1024):
+        super().__init__()
+        d = mlp_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_size, d), nn.LayerNorm(d), nn.SiLU(),
+            nn.Linear(d, d), nn.LayerNorm(d), nn.SiLU(),
+            nn.Linear(d, num_bins),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        with torch.no_grad():
+            # Symlog two-hot: value 0 sits at the center bin, so bias toward it.
+            self.net[-1].bias[num_bins // 2] = 10.0
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ==========================================================
+# TSSM CORE (Transformer State-Space Model)
+# ==========================================================
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+def _rope_cos_sin(pos, half_dim, device, base=10000.0):
+    """cos/sin tables for rotary embeddings at (possibly per-row) positions `pos`."""
+    inv_freq = base ** (-torch.arange(half_dim, device=device, dtype=torch.float32) / half_dim)
+    angles = pos.to(torch.float32).unsqueeze(-1) * inv_freq
+    return torch.cos(angles), torch.sin(angles)
+
+
+def _apply_rope(x, cos, sin):
+    """Rotate the head dimension of x [..., Dh]; cos/sin broadcast to x[..., :Dh/2]."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+
+
+class TSSMCache:
+
+    def __init__(self, n_layers, batch, max_len, n_kv_heads, head_dim, device, dtype=torch.float32):
+        self.k = torch.zeros(n_layers, batch, max_len, n_kv_heads, head_dim, device=device, dtype=dtype)
+        self.v = torch.zeros_like(self.k)
+        self.pos = torch.zeros(batch, dtype=torch.long, device=device)
+        self.key_pos = torch.full((batch, max_len), -1, dtype=torch.long, device=device)
+        self.max_len = max_len
+
+    def reset_rows(self, rows):
+        """Clear the context of the given row(s) (e.g. on environment reset)."""
+        self.pos[rows] = 0
+        self.key_pos[rows] = -1
+
+    def prefill(self, kv, row_idx, lengths):
+        """Load real-history context: for each cache row i, the first `lengths[i]`
+        tokens of source sequence `row_idx[i]` become its attention context.
+        `kv` is a per-layer list of (k, v), each [B, T, H_kv, Dh] (RoPE already applied)."""
+        T = kv[0][0].shape[1]
+        assert T <= self.max_len, "prefill longer than cache"
+        for li, (k, v) in enumerate(kv):
+            self.k[li, :, :T] = k[row_idx]
+            self.v[li, :, :T] = v[row_idx]
+        lengths = lengths.to(self.pos.device, dtype=torch.long)
+        steps = torch.arange(T, device=self.pos.device)
+        kp = steps[None, :].expand(lengths.shape[0], T).clone()
+        kp[steps[None, :] >= lengths[:, None]] = -1
+        self.key_pos[:, :T] = kp
+        self.key_pos[:, T:] = -1
+        self.pos = lengths.clone()
+
+
+class TSSMBlock(nn.Module):
+    """Pre-norm transformer block: RMSNorm -> causal attention (RoPE, QKNorm, GQA)
+    -> residual -> RMSNorm -> SwiGLU -> residual."""
+    def __init__(self, d_model, n_heads, n_kv_heads, ffn_hidden):
+        super().__init__()
+        assert d_model % n_heads == 0 and n_heads % n_kv_heads == 0
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = d_model // n_heads
+        self.groups = n_heads // n_kv_heads
+        hd = self.head_dim
+        self.norm_attn = RMSNorm(d_model)
+        self.norm_mlp = RMSNorm(d_model)
+        self.q_proj = nn.Linear(d_model, n_heads * hd, bias=False)
+        self.k_proj = nn.Linear(d_model, n_kv_heads * hd, bias=False)
+        self.v_proj = nn.Linear(d_model, n_kv_heads * hd, bias=False)
+        self.o_proj = nn.Linear(n_heads * hd, d_model, bias=False)
+        self.q_norm = RMSNorm(hd)   # QKNorm for attention stability (Dreamer 4)
+        self.k_norm = RMSNorm(hd)
+        self.gate_proj = nn.Linear(d_model, ffn_hidden, bias=False)
+        self.up_proj = nn.Linear(d_model, ffn_hidden, bias=False)
+        self.down_proj = nn.Linear(ffn_hidden, d_model, bias=False)
+
+    def _mlp(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    def forward_train(self, x, cos, sin, attn_mask):
+        """Parallel forward over a full sequence with a windowed-causal mask.
+        x: [B, T, d]; attn_mask: [T, T] bool (True = may attend).
+        Returns the block output and the (post-RoPE) K/V for KV-cache reuse."""
+        B, T, _ = x.shape
+        h = self.norm_attn(x)
+        q = self.q_proj(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = _apply_rope(self.q_norm(q), cos, sin)
+        k = _apply_rope(self.k_norm(k), cos, sin)
+        # GQA: expand KV heads to match query heads for the fused kernel.
+        kr = k.repeat_interleave(self.groups, dim=1)
+        vr = v.repeat_interleave(self.groups, dim=1)
+        #with sdpa_kernel(SDPBackend.MATH):
+        #    attn = F.scaled_dot_product_attention(q, kr, vr, attn_mask=attn_mask)
+        attn = F.scaled_dot_product_attention(q, kr, vr, attn_mask=attn_mask)
+        x = x + self.o_proj(attn.transpose(1, 2).reshape(B, T, -1))
+        x = x + self._mlp(self.norm_mlp(x))
+        return x, (k.transpose(1, 2), v.transpose(1, 2))  # cache layout [B, T, H_kv, Dh]
+
+    def forward_step(self, x, k_cache, v_cache, slot, key_mask, cos, sin):
+        """Single-token decode through the KV cache (imagination / acting).
+        x: [N, d]; k_cache/v_cache: [N, L, H_kv, Dh]; slot: [N]; key_mask: [N, L]."""
+        N = x.shape[0]
+        h = self.norm_attn(x)
+        q = self.q_proj(h).view(N, self.n_heads, self.head_dim)
+        k = self.k_proj(h).view(N, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(h).view(N, self.n_kv_heads, self.head_dim)
+        q = _apply_rope(self.q_norm(q), cos, sin)
+        k = _apply_rope(self.k_norm(k), cos, sin)
+        rows = torch.arange(N, device=x.device)
+        k_cache[rows, slot] = k
+        v_cache[rows, slot] = v
+        qg = q.view(N, self.n_kv_heads, self.groups, self.head_dim)
+        scores = torch.einsum('nkgd,nlkd->nkgl', qg, k_cache) / (self.head_dim ** 0.5)
+        scores = scores.masked_fill(~key_mask[:, None, None, :], float('-inf'))
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.einsum('nkgl,nlkd->nkgd', probs, v_cache).reshape(N, -1)
+        x = x + self.o_proj(out)
+        x = x + self._mlp(self.norm_mlp(x))
+        return x
+
+
+class TSSM(nn.Module):
+    def __init__(self, d_model=1024, latentSize=1600, actionSize=6,
+                 n_layers=4, n_heads=8, n_kv_heads=2, ffn_hidden=2816, window=192,
+                 z_rows=40, z_cols=40, z_embed_dim=32, a_embed_dim=64, embed_hidden=None):
+        super().__init__()
+        assert z_rows * z_cols == latentSize, "z_rows * z_cols must equal latentSize"
+        self.d_model = d_model
+        self.recurrentSize = d_model  # output size (kept name-compatible with the GRU model)
+        self.latentSize = latentSize
+        self.actionSize = actionSize
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = d_model // n_heads
+        self.window = window
+        self.z_rows = z_rows
+        self.z_cols = z_cols
+
+        # --- Token tokenizer for u_t = (z_t, a_t) ---
+        self.z_embed = nn.Parameter(torch.randn(z_rows, z_cols, z_embed_dim) * 0.02)
+        self.a_embed = nn.Linear(actionSize, a_embed_dim, bias=False)
+        embed_hidden = embed_hidden if embed_hidden is not None else ffn_hidden
+        self.embed_in = nn.Linear(z_rows * z_embed_dim + a_embed_dim, d_model, bias=False)
+        self.embed_prenorm = RMSNorm(d_model)
+        self.embed_gate = nn.Linear(d_model, embed_hidden, bias=False)
+        self.embed_up = nn.Linear(d_model, embed_hidden, bias=False)
+        self.embed_down = nn.Linear(embed_hidden, d_model, bias=False)
+        self.embed_norm = RMSNorm(d_model)
+        nn.init.zeros_(self.embed_down.weight)  # residual branch starts as identity
+
+        self.blocks = nn.ModuleList(
+            [TSSMBlock(d_model, n_heads, n_kv_heads, ffn_hidden) for _ in range(n_layers)])
+        self.norm_out = RMSNorm(d_model)
+
+    def embed(self, latent, action):
+        """Token embedding for u_t = (z_t, a_t). latent [..., Z] one-hot blocks,
+        action [..., A]; returns [..., d_model]. Factorized latent lookup + action
+        embedding, fused by a pre-norm SwiGLU MLP with a residual connection."""
+        z = latent.view(*latent.shape[:-1], self.z_rows, self.z_cols)
+        e = torch.einsum('...rc,rcd->...rd', z, self.z_embed).flatten(-2)
+        x = self.embed_in(torch.cat((e, self.a_embed(action)), -1))   # -> d_model
+        h = self.embed_prenorm(x)
+        h = self.embed_down(F.silu(self.embed_gate(h)) * self.embed_up(h))  # SwiGLU
+        x = x + h
+        return self.embed_norm(x)
+
+    def make_cache(self, batch, max_len, device, dtype=torch.float32):
+        return TSSMCache(len(self.blocks), batch, max_len, self.n_kv_heads,
+                         self.head_dim, device, dtype)
+
+    def forward_sequence(self, latents, actions, return_kv=False):
+        """Parallel training pass. latents [B, T, Z], actions [B, T, A] are the
+        tokens u_t = (z_t, a_t); output [:, t] is h_{t+1}. Optionally returns the
+        detached per-layer K/V so imagination can reuse them as prefix context."""
+        x = self.embed(latents, actions)
+        T = x.shape[1]
+        pos = torch.arange(T, device=x.device)
+        cos, sin = _rope_cos_sin(pos, self.head_dim // 2, x.device)
+        cos, sin = cos[None, None], sin[None, None]
+        # Banded causal mask: attend to self and up to `window - 1` steps back.
+        rel = pos[:, None] - pos[None, :]
+        attn_mask = (rel >= 0) & (rel < self.window)
+        kv = [] if return_kv else None
+        for blk in self.blocks:
+            x, layer_kv = blk.forward_train(x, cos, sin, attn_mask)
+            if return_kv:
+                kv.append((layer_kv[0].detach(), layer_kv[1].detach()))
+        return self.norm_out(x), kv
+
+    def forward_step(self, latent, action, cache):
+        """Append one (z, a) token per row and return the next deterministic state
+        h. latent [N, Z], action [N, A]; the KV cache is updated in place."""
+        x = self.embed(latent, action)
+        pos = cache.pos
+        slot = pos % cache.max_len
+        rows = torch.arange(x.shape[0], device=x.device)
+        cache.key_pos[rows, slot] = pos  # current token becomes an attendable key
+        cos, sin = _rope_cos_sin(pos, self.head_dim // 2, x.device)
+        cos, sin = cos[:, None], sin[:, None]
+        # Same sliding window as training, over absolute key positions.
+        key_mask = (cache.key_pos >= 0) & (cache.key_pos > (pos - self.window)[:, None])
+        for li, blk in enumerate(self.blocks):
+            x = blk.forward_step(x, cache.k[li], cache.v[li], slot, key_mask, cos, sin)
+        cache.pos = pos + 1
+        return self.norm_out(x)
+
+
+class PriorNet(nn.Module):
+    def __init__(self, recurrentSize=512, rows=16, cols=16, mlp_dim=1024):
+        super().__init__()
+        self.recurrentSize = recurrentSize
+        self.latentSize = rows * cols
+        self.rows = rows
+        self.cols = cols
+        self.trasform = _mlp3(recurrentSize, rows * cols, hidden=mlp_dim, act=nn.SiLU)
+
+    def forward(self, RecurrentState, unimix=True):
+        """unimix=True mixes 1% uniform into the categorical (training: keeps KL
+        gradients alive). unimix=False samples the raw distribution (imagination:
+        avoids injecting random latent flips that compound over the rollout)."""
+        rawLogits = self.trasform(RecurrentState)
+        rawProbabilities = rawLogits.view(-1, self.rows, self.cols).softmax(-1)
+        if unimix:
+            confusion = torch.ones_like(rawProbabilities) / self.cols
+            probabilities = 0.99 * rawProbabilities + 0.01 * confusion
+        else:
+            probabilities = rawProbabilities
+        logits = probs_to_logits(probabilities)
+        sample = Independent(OneHotCategoricalStraightThrough(probs=probabilities), 1).rsample().view(-1, self.latentSize)
+        return sample, logits
+
+
+class PosteriorNet(nn.Module):
+    def __init__(self, inputSize=1536, rows=16, cols=16, mlp_dim=1024):
+        super().__init__()
+        self.inputSize = inputSize
+        self.rows = rows
+        self.cols = cols
+        self.latentSize = rows * cols
+        self.trasform = _mlp3(inputSize, self.latentSize, hidden=mlp_dim, act=nn.SiLU)
+
+    def forward(self, InputState):
+        rawLogits = self.trasform(InputState)
+        rawProbabilities = rawLogits.view(-1, self.rows, self.cols).softmax(-1)
+        confusion = torch.ones_like(rawProbabilities) / self.cols
+        probabilities = 0.99 * rawProbabilities + 0.01 * confusion
+        logits = probs_to_logits(probabilities)
+        sample = Independent(OneHotCategoricalStraightThrough(probs=probabilities), 1).rsample().view(-1, self.rows * self.cols)
+        return sample, logits
+
+
+# ==========================================================
+# ACTOR / CRITIC
+# ==========================================================
+class Actor(nn.Module):
+    def __init__(self, action_dim, device, concatenated_dim=768, mlp_dim=1024):
+        super().__init__()
+        self.device = device
+        self.action_dim = action_dim
+        self.concatenated_dim = concatenated_dim
+        self.net = _mlp3(concatenated_dim, action_dim, hidden=mlp_dim, act=nn.SiLU)
+        nn.init.uniform_(self.net[-1].weight, -0.01, 0.01)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        raw_logits = self.net(x)
+        probs = torch.softmax(raw_logits, dim=-1)
+        uniform = torch.ones_like(probs) / self.action_dim
+        mixed_probs = 0.99 * probs + 0.01 * uniform
+        dist = OneHotCategorical(probs=mixed_probs)
+        action_onehot = dist.sample()
+        return action_onehot, dist.log_prob(action_onehot), dist.entropy()
+
+
+class Critic(nn.Module):
+    def __init__(self, inputSize, bins=255, mlp_dim=1024):
+        super().__init__()
+        self.transform = _mlp3(inputSize, bins, hidden=mlp_dim, act=nn.SiLU)
+        nn.init.zeros_(self.transform[-1].weight)
+        nn.init.zeros_(self.transform[-1].bias)
+
+    def forward(self, x):
+        return self.transform(x)
+
+
+# ==========================================================
+# REPLAY BUFFER
+# ==========================================================
+class Buffer(object):
+    def __init__(self, device, capacity=800000, actionSize=6,
+                 ltm_reward_dim=LTM_REWARD_DIM,
+                 item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM,
+                 reward_sample_fraction=0.10, curiosity_sample_fraction=0.10,
+                 recent_sample_fraction=0.20):
+        self.device = device
+        self.capacity = capacity
+        self.num_envs = num_envs
+        self._pin = torch.cuda.is_available()
+        # Guards episode flushes (writes) against concurrent sample() calls now that
+        # collection runs on a background thread overlapped with training.
+        self.lock = threading.Lock()
+        self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
+        self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
+        self.map_ids = torch.empty((capacity, 1), dtype=torch.uint8, device='cpu')  # raw map number
+        self.grids = torch.empty((capacity, grid_dim), dtype=torch.uint8, device='cpu')
+        self.item_counts = torch.empty((capacity, item_dim), dtype=torch.float32, device='cpu')
+        self.team_levels = torch.empty((capacity, team_level_dim), dtype=torch.float32, device='cpu')
+        self.actions = torch.empty((capacity, actionSize), dtype=torch.float32, device='cpu')
+        self.sparse_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        self.standard_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        self.curiosities = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        self.tier_events = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        self.episode_ids = torch.zeros((capacity,), dtype=torch.long, device='cpu')
+        self._episode_counter = 0
+
+        self.index = 0
+        self.full = False
+
+        self._reward_positions = set()
+        self._curiosity_positions = set()
+        self.reward_sample_fraction = reward_sample_fraction
+        self.curiosity_sample_fraction = curiosity_sample_fraction
+        self.recent_sample_fraction = recent_sample_fraction
+
+    def add(self, observation, ltm_reward, map_id, grid, item_count, team_level, action,
+            sparse_reward, standard_reward, curiosity, tier_event):
+        self._reward_positions.discard(self.index)
+        self._curiosity_positions.discard(self.index)
+        self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
+        self.ltm_rewards[self.index] = torch.as_tensor(ltm_reward, dtype=torch.uint8)
+        self.map_ids[self.index] = torch.as_tensor(map_id, dtype=torch.uint8)
+        self.grids[self.index] = torch.as_tensor(grid, dtype=torch.uint8)
+        self.item_counts[self.index] = torch.as_tensor(item_count, dtype=torch.float32)
+        self.team_levels[self.index] = torch.as_tensor(team_level, dtype=torch.float32)
+        self.actions[self.index] = torch.as_tensor(action, dtype=torch.float32)
+        self.sparse_rewards[self.index] = torch.as_tensor(sparse_reward, dtype=torch.float32)
+        self.standard_rewards[self.index] = torch.as_tensor(standard_reward, dtype=torch.float32)
+        self.curiosities[self.index] = torch.as_tensor(curiosity, dtype=torch.float32)
+        self.tier_events[self.index] = torch.as_tensor(tier_event, dtype=torch.float32)
+        self.episode_ids[self.index] = self._episode_counter
+
+        if float(sparse_reward) > 0.0:
+            self._reward_positions.add(self.index)
+        if float(tier_event) > 0.0:
+            self._curiosity_positions.add(self.index)
+
+        self.index = (self.index + 1) % self.capacity
+        self.full = self.full or (self.index == 0)
+
+    def end_episode(self):
+        """Mark an episode boundary; call after flushing one episode's transitions."""
+        self._episode_counter += 1
+
+    def _same_episode(self, rows):
+        """rows: [num, T] index matrix -> bool [num], True if the whole window lies
+        within one episode. Episode ids are monotone in write order, so equal ids at
+        the two endpoints imply the interior is uniform too (T << capacity). This
+        also catches windows that wrap across the write head into stale data."""
+        return self.episode_ids[rows[:, 0]] == self.episode_ids[rows[:, -1]]
+
+    def _sequences_covering(self, positions, num, sequenceSize, max_tries=8):
+        pos = torch.tensor(sorted(positions), dtype=torch.long)
+        seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
+
+        def draw(n):
+            pick = pos[torch.randint(0, pos.numel(), (n, 1))]
+            in_seq = torch.randint(0, sequenceSize, (n, 1))
+            if self.full:
+                starts = (pick - in_seq) % self.capacity
+            else:
+                starts = torch.clamp(pick - in_seq, 0, self.index - sequenceSize)
+            return (starts + seq_offsets) % self.capacity
+
+        rows = draw(num)
+        for _ in range(max_tries):
+            bad = ~self._same_episode(rows)
+            if not bad.any():
+                break
+            rows[bad] = draw(int(bad.sum()))
+        return rows
+
+    def sample(self, batchSize, sequenceSize):
+        """Thread-safe wrapper: the lock keeps gathered windows consistent while the
+        collector thread flushes finished episodes into the buffer."""
+        with self.lock:
+            return self._sample(batchSize, sequenceSize)
+
+    def _sample(self, batchSize, sequenceSize):
+        N = self.capacity if self.full else self.index
+        if N < sequenceSize:
+            return None
+
+        num_recent = int(round(batchSize * self.recent_sample_fraction))
+        num_all = batchSize - num_recent
+        sample_indices = []
+
+        # `recent_sample_fraction` of the batch comes from a recent window, the
+        # remainder uniformly across the whole buffer.
+        if num_recent > 0:
+            effective_window = min(15000 * self.num_envs, N)
+            max_offset = effective_window - sequenceSize
+            if max_offset >= 0:
+                seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
+
+                def draw_recent(n):
+                    offsets = torch.randint(0, max_offset + 1, (n, 1))
+                    recent_starts = (self.index - sequenceSize - offsets) % self.capacity
+                    return (recent_starts + seq_offsets) % self.capacity
+
+                rows = draw_recent(num_recent)
+                for _ in range(8):  # redraw windows that cross an episode boundary
+                    bad = ~self._same_episode(rows)
+                    if not bad.any():
+                        break
+                    rows[bad] = draw_recent(int(bad.sum()))
+                sample_indices.append(rows)
+            else:
+                num_all += num_recent
+
+        # Bias-aware injection: force a fraction of the batch to cover reward / tier-event slots.
+        if self._reward_positions and self.reward_sample_fraction > 0.0:
+            num_reward = min(int(round(batchSize * self.reward_sample_fraction)), num_all)
+            if num_reward > 0:
+                num_all -= num_reward
+                sample_indices.append(
+                    self._sequences_covering(self._reward_positions, num_reward, sequenceSize))
+
+        if self._curiosity_positions and self.curiosity_sample_fraction > 0.0:
+            num_curiosity = min(int(round(batchSize * self.curiosity_sample_fraction)), num_all)
+            if num_curiosity > 0:
+                num_all -= num_curiosity
+                sample_indices.append(
+                    self._sequences_covering(self._curiosity_positions, num_curiosity, sequenceSize))
+
+        if num_all > 0:
+            limit = self.capacity if self.full else (self.index - sequenceSize + 1)
+            if limit <= 0:
+                return None
+            seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
+
+            def draw_uniform(n):
+                return (torch.randint(0, limit, (n, 1)) + seq_offsets) % self.capacity
+
+            rows = draw_uniform(num_all)
+            for _ in range(8):  # redraw windows that cross an episode boundary
+                bad = ~self._same_episode(rows)
+                if not bad.any():
+                    break
+                rows[bad] = draw_uniform(int(bad.sum()))
+            sample_indices.append(rows)
+
+        sampleIndex = torch.cat(sample_indices, dim=0).long()
+        batch = {
+            "observations":       self.observations[sampleIndex],   # uint8
+            "ltm_rewards":        self.ltm_rewards[sampleIndex],     # uint8
+            "map_ids":            self.map_ids[sampleIndex],         # uint8 (raw map number)
+            "grids":              self.grids[sampleIndex],           # uint8
+            "item_counts":        self.item_counts[sampleIndex],
+            "team_levels":        self.team_levels[sampleIndex],
+            "actions":            self.actions[sampleIndex],
+            "sparse_rewards":     self.sparse_rewards[sampleIndex],
+            "standard_rewards":   self.standard_rewards[sampleIndex],
+            "curiosities":        self.curiosities[sampleIndex],
+            "tier_events":        self.tier_events[sampleIndex],
+            "index":              sampleIndex,
+        }
+        if self._pin:
+            batch = {k: v.pin_memory() for k, v in batch.items()}
+        return batch
+
+    def save(self, path):
+        limit = self.capacity if self.full else self.index
+        torch.save({
+            'observations': self.observations[:limit],
+            'ltm_rewards': self.ltm_rewards[:limit],
+            'map_ids': self.map_ids[:limit],
+            'grids': self.grids[:limit],
+            'item_counts': self.item_counts[:limit],
+            'team_levels': self.team_levels[:limit],
+            'actions': self.actions[:limit],
+            'sparse_rewards': self.sparse_rewards[:limit],
+            'standard_rewards': self.standard_rewards[:limit],
+            'curiosities': self.curiosities[:limit],
+            'tier_events': self.tier_events[:limit],
+            'episode_ids': self.episode_ids[:limit],
+            'index': self.index,
+            'full': self.full,
+        }, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location='cpu')
+        n = min(ckpt['observations'].shape[0], self.capacity)
+        for name in ('observations', 'ltm_rewards', 'map_ids', 'grids', 'item_counts',
+                     'team_levels', 'actions', 'sparse_rewards', 'standard_rewards',
+                     'curiosities', 'tier_events', 'episode_ids'):
+            getattr(self, name)[:n] = ckpt[name][:n]  # KeyError = incompatible old buffer
+        self.index = n % self.capacity
+        self.full = (n == self.capacity)
+        # Resume episode numbering above anything restored.
+        self._episode_counter = int(self.episode_ids[:n].max().item()) + 1 if n > 0 else 0
+        reward_slots = (self.sparse_rewards[:n].squeeze(-1) > 0.0).nonzero(as_tuple=False).flatten()
+        self._reward_positions = set(reward_slots.tolist())
+        curiosity_slots = (self.tier_events[:n].squeeze(-1) > 0.0).nonzero(as_tuple=False).flatten()
+        self._curiosity_positions = set(curiosity_slots.tolist())
+        print(f"[*] Loaded buffer with {n} transitions (full={self.full}, write_head={self.index}, "
+              f"reward_positions={len(self._reward_positions)}, "
+              f"curiosity_positions={len(self._curiosity_positions)})")
+
+    def print_diagnostics(self):
+        valid = self.capacity if self.full else self.index
+        print("\n" + "=" * 50)
+        print("          REPLAY BUFFER DIAGNOSTICS")
+        print("=" * 50)
+        print(f"  Buffer Fill : {valid:,} / {self.capacity:,} ({100.0 * valid / self.capacity:.2f}%)")
+        print(f"  Active Environments : {self.num_envs}")
+        print(f"  Recent Sampling Window Size : {20000 * self.num_envs:,} steps")
+        print("=" * 50 + "\n")
+
+
+# ==========================================================
+# BACKGROUND BATCH PREFETCHER
+# ==========================================================
+class BatchPrefetcher:
+    """Samples pinned CPU batches on a background thread so the gather overlaps GPU
+    training. Safe alongside the collector thread: buffer.sample() and episode
+    flushes are serialized by buffer.lock."""
+
+    def __init__(self, buffer, batch_size, sequence_size, depth=3):
+        self.buffer = buffer
+        self.batch_size = batch_size
+        self.sequence_size = sequence_size
+        self._q = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while not self._stop.is_set():
+            batch = self.buffer.sample(self.batch_size, self.sequence_size)
+            if batch is None:
+                time.sleep(0.01)
+                continue
+            # Block until there's room, but stay responsive to close().
+            while not self._stop.is_set():
+                try:
+                    self._q.put(batch, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def get(self):
+        return self._q.get()
+
+    def close(self):
+        self._stop.set()
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=1.0)
+
+
+# ==========================================================
+# DREAMER
+# ==========================================================
+class Dreamer:
+    def __init__(self, device, envs,
+                 action_dim=6, recurrent_dim=1024, rows=40, cols=40,
+                 tssm_layers=4, tssm_heads=8, tssm_kv_heads=2, tssm_ffn=2816,
+                 context_length=192,
+                 number_of_sequences=32, steps_per_sequence=256, dreams_per_sequence=1,
+                 buffer_size=1500000,
+                 team_dim=6, item_dim=2, curiosity_scale=0.25, mlp_dim=1024,
+                 reward_sample_fraction=0.05, curiosity_sample_fraction=0.05,
+                 entropy_scale=0.0015, recent_sample_fraction=0.35,
+                 teamitem_out=128, ltm_reward_out=512, map_class_out=512, grid_out=128,
+                 dream_priority_fraction=0.05, dream_reward_priority_fraction=0.05,
+                 dream_lead_steps=10, ltm_gate_threshold=0.4, grid_gate_threshold=0.5,
+                 grid_zero_weight=5.0,
+                 critic_ema_decay=0.98,
+                 var_beta_dyn=0.5, var_beta_reg=0.1, var_warmup_steps=20000,
+                 loss_norm_decay=0.99, reward_loss_weight=10.0,
+                 bt_loss_weight=2.0, bt_alpha=5e-4,  # Barlow Twins (R2-Dreamer) repr. loss
+                 decoder_train_frames=512,  # detached viz-decoder frames per update
+                 continue_discount=0.998, pmpo_alpha=0.5):
+
+        # --- Dimensions / config ---
+        self.device = device
+        self.action_dim = action_dim
+        self.recurrent_dim = recurrent_dim
+        self.mlp_dim = mlp_dim
+        self.rows = rows
+        self.cols = cols
+        self.latent_dim = rows * cols
+        self.concatenated_dim = recurrent_dim + self.latent_dim
+        self.total_num_episodes = 0
+        self.total_num_steps = 0
+        self.total_num_updates = 0
+
+        # Auxiliary feature sizes feeding the posterior.
+        self.image_out = 1024
+        self.teamitem_out = teamitem_out
+        self.ltm_reward_out = ltm_reward_out
+        self.map_class_out = map_class_out
+        self.grid_out = grid_out
+        self.team_dim = team_dim
+        self.item_dim = item_dim
+        self.enconder_output_size = (self.image_out + self.teamitem_out
+                                     + self.ltm_reward_out + self.map_class_out
+                                     + self.grid_out)
+
+        self.entropy_scale = entropy_scale
+        self.number_of_sequences = number_of_sequences
+        self.steps_per_sequence = steps_per_sequence
+        self.dreams_per_sequence = dreams_per_sequence  # dream starts sampled per replay sequence
+        self.buffer_capacity = buffer_size
+        self.reward_sample_fraction = reward_sample_fraction
+        self.curiosity_sample_fraction = curiosity_sample_fraction
+        self.recent_sample_fraction = recent_sample_fraction
+        self.curiosity_scale = curiosity_scale
+        self.envs = envs
+
+        # PMPO
+        self.pmpo_alpha = pmpo_alpha
+
+        # Whole-game LTM loss shaping (sparse multi-label targets).
+        self.ltm_reward_pos_weight = torch.tensor(200.0, device=self.device)
+        self.ltm_sparsity_weight = 0.5
+        # Map-class category index lookup (map id -> {0,1,2}) for the decoder target.
+        self.map_class_index = torch.tensor(MAP_CLASS_INDEX, dtype=torch.long, device=self.device)
+
+        # Exploration: fraction of dream starts resampled from high-novelty states.
+        self.dream_priority_fraction = dream_priority_fraction
+        self.dream_reward_priority_fraction = dream_reward_priority_fraction
+        self.dream_lead_steps = dream_lead_steps
+
+        # Dream sparse-reward curiosity gating
+        self.ltm_gate_threshold = ltm_gate_threshold
+        # Dream tile-curiosity gating
+        self.grid_gate_threshold = grid_gate_threshold
+        # Extra BCE weight on unexplored (target=0) grid cells: free tiles are rare
+        # in the buffer, so unweighted BCE lets the predictor default to "explored".
+        self.grid_zero_weight = grid_zero_weight
+
+        # --- Encodings ---
+        self.two_hot = TwoHotEncoding(device=self.device)
+
+        # --- TSSM (transformer state-space model) ---
+        self.context_length = context_length
+        self.recurrentModel = TSSM(d_model=self.recurrent_dim, latentSize=self.latent_dim,actionSize=self.action_dim, n_layers=tssm_layers,n_heads=tssm_heads, n_kv_heads=tssm_kv_heads,ffn_hidden=tssm_ffn, window=context_length,z_rows=self.rows, z_cols=self.cols).to(self.device)
+        self.posteriorNet = PosteriorNet(self.enconder_output_size, self.rows, self.cols, mlp_dim=self.mlp_dim).to(self.device)
+        self.priorNet = PriorNet(self.recurrent_dim, self.rows, self.cols, mlp_dim=self.mlp_dim).to(self.device)
+
+        # --- Encoders ---
+        self.image_encoder = EncoderImage(output_size=self.image_out).to(self.device)
+        self.teamitem_encoder = TeamItemEncoder(self.team_dim + self.item_dim, self.teamitem_out, hidden=self.mlp_dim).to(self.device)
+        self.ltm_reward_encoder = LongTermMemoryEncoder(LTM_REWARD_DIM, self.ltm_reward_out, hidden=self.mlp_dim).to(self.device)
+        self.map_class_encoder = MapClassEncoder(self.map_class_out, hidden=self.mlp_dim).to(self.device)
+        self.grid_encoder = GridEncoder(GRID_DIM, self.grid_out, hidden=self.mlp_dim).to(self.device)
+
+        # --- Predictors (latent -> observation components) ---
+        self.sparseRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.standardRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.curiosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.teamitemPredictor = TeamItemPredictor(self.concatenated_dim, self.team_dim + self.item_dim, hidden=self.mlp_dim).to(self.device)
+        self.ltm_reward_predictor = LongTermMemoryPredictor(self.concatenated_dim, LTM_REWARD_DIM, hidden=self.mlp_dim).to(self.device)
+        self.map_class_predictor = MapClassPredictor(self.concatenated_dim, hidden=self.mlp_dim).to(self.device)
+        self.grid_predictor = GridPredictor(self.concatenated_dim, GRID_DIM, hidden=self.mlp_dim).to(self.device)
+
+        # --- Barlow Twins projector (R2-Dreamer): latent state -> image-embedding space ---
+        self.bt_projector = nn.Linear(self.concatenated_dim, self.image_out, bias=False).to(self.device)
+        self.bt_loss_weight = bt_loss_weight
+        self.bt_alpha = bt_alpha
+
+        # --- Visualization decoder (detached; NOT part of the world-model objective) ---
+        self.decoder = Decoder(input_size=self.concatenated_dim).to(self.device)
+        self.decoder_train_frames = decoder_train_frames
+
+        # --- Actor / Critics ---
+        self.actor = Actor(self.action_dim, self.device, self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.critic = Critic(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.ema_critic = copy.deepcopy(self.critic)
+        for p in self.ema_critic.parameters():
+            p.requires_grad = False
+        self.curiosity_critic = Critic(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.critic_ema_decay = critic_ema_decay
+
+
+        # Latent-space value-alignment regularization (Var) config.
+        self.var_beta_dyn = var_beta_dyn
+        self.var_beta_reg = var_beta_reg
+        self.var_warmup_steps = var_warmup_steps  # gated on total_num_updates (persisted in checkpoints)
+        # DreamerV4-style loss normalization: EMA of each term's RMS (KL and Var excluded).
+        self.loss_norm_decay = loss_norm_decay
+        self._loss_rms = {}
+        # Priority boosts applied on top of the unit-scale normalization.
+        self.reward_loss_weight = reward_loss_weight
+        self.continue_discount = continue_discount
+
+        # --- Buffer ---
+        self.buffer = Buffer(
+            device=self.device, capacity=self.buffer_capacity, actionSize=self.action_dim,
+            ltm_reward_dim=LTM_REWARD_DIM,
+            item_dim=self.item_dim, team_level_dim=self.team_dim,
+            num_envs=len(envs), grid_dim=GRID_DIM,
+            reward_sample_fraction=self.reward_sample_fraction,
+            curiosity_sample_fraction=self.curiosity_sample_fraction,
+            recent_sample_fraction=self.recent_sample_fraction,
+        )
+
+        # --- World-model parameter group ---
+        self.worldModelParameters = (
+            list(self.recurrentModel.parameters())
+            + list(self.posteriorNet.parameters())
+            + list(self.priorNet.parameters())
+            + list(self.sparseRewardPredictor.parameters())
+            + list(self.standardRewardPredictor.parameters())
+            + list(self.image_encoder.parameters())
+            + list(self.teamitem_encoder.parameters())
+            + list(self.ltm_reward_encoder.parameters())
+            + list(self.map_class_encoder.parameters())
+            + list(self.grid_encoder.parameters())
+            + list(self.teamitemPredictor.parameters())
+            + list(self.ltm_reward_predictor.parameters())
+            + list(self.map_class_predictor.parameters())
+            + list(self.grid_predictor.parameters())
+            + list(self.bt_projector.parameters())
+        )
+
+        # --- Optimizers ---
+        self.worldModelOptimizer = torch.optim.Adam(self.worldModelParameters, lr=2e-4)
+        self.actorOptimizer = torch.optim.Adam(self.actor.parameters(), lr=4e-5)
+        self.criticOptimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
+        self.curiosityCriticOptimizer = torch.optim.Adam(self.curiosity_critic.parameters(), lr=1e-4)
+        self.curiosityHeadOptimizer = torch.optim.Adam(
+            self.curiosityPredictor.parameters(), lr=1e-4)
+        # Visualization decoder trains on detached states, outside the world model.
+        self.decoderOptimizer = torch.optim.Adam(self.decoder.parameters(), lr=2e-4)
+
+    # ------------------------------------------------------
+    def sample_batch(self, batchSize, sequenceSize):
+        return self._batch_to_device(self.buffer.sample(batchSize, sequenceSize))
+
+    def _batch_to_device(self, cpu_batch):
+        """Move a pinned CPU batch to the device (non_blocking) and apply dtype conversions."""
+        if cpu_batch is None:
+            return None
+        out = {k: v.to(self.device, non_blocking=True) for k, v in cpu_batch.items()}
+        out["observations"] = out["observations"].float() / 255.0
+        out["ltm_rewards"] = out["ltm_rewards"].float()
+        out["map_ids"] = out["map_ids"].long()   # raw map ids (indices), keep integer
+        out["grids"] = out["grids"].float()
+        return out
+
+    def computeLambdaValues(self, rewards, values, continues, lambda_=0.95):
+        returns = torch.zeros_like(rewards)
+        bootstrap = values[:, -1]
+        for i in reversed(range(rewards.shape[-1])):
+            returns[:, i] = rewards[:, i] + continues[:, i] * ((1 - lambda_) * values[:, i + 1] + lambda_ * bootstrap)
+            bootstrap = returns[:, i]
+        return returns
+
+    def _pmpo_loss(self, advantages, log_probabilities):
+        adv = advantages.detach()
+        pos = (adv >= 0).float()
+        neg = 1.0 - pos
+        pos_logprob = (log_probabilities * pos).sum() / pos.sum().clamp(min=1.0)
+        neg_logprob = (log_probabilities * neg).sum() / neg.sum().clamp(min=1.0)
+        return -self.pmpo_alpha * pos_logprob + (1.0 - self.pmpo_alpha) * neg_logprob
+
+    def _barlow_twins_loss(self, states, image_embed):
+        """R2-Dreamer redundancy-reduction objective (Barlow Twins, Zbontar et al. 2021).
+        Aligns the projected latent state k_t = P(s_t) with the (detached) image
+        embedding e_t via their cross-correlation matrix over the B*T batch:
+        L = sum_i (1 - C_ii)^2 + alpha * sum_{i != j} C_ij^2. Replaces pixel
+        reconstruction as the representation-learning signal (no decoder gradient)."""
+        k = self.bt_projector(states).reshape(-1, self.image_out)
+        e = image_embed.detach().reshape(-1, self.image_out)  # stop-gradient target
+        k = (k - k.mean(dim=0)) / (k.std(dim=0) + 1e-5)       # standardize over batch
+        e = (e - e.mean(dim=0)) / (e.std(dim=0) + 1e-5)
+        C = (k.T @ e) / k.shape[0]                            # [D, D]
+        diag = torch.diagonal(C)
+        invariance = ((diag - 1.0) ** 2).sum()
+        redundancy = C.pow(2).sum() - diag.pow(2).sum()       # off-diagonal terms
+        return invariance + self.bt_alpha * redundancy
+
+    def _ltm_loss(self, pred_logits, target, pos_weight):
+        """Weighted BCE + sparsity penalty for sparse whole-game multi-label targets."""
+        bce = F.binary_cross_entropy_with_logits(pred_logits, target, pos_weight=pos_weight)
+        sparsity = (torch.sigmoid(pred_logits) * (1.0 - target)).mean()
+        return bce + self.ltm_sparsity_weight * sparsity
+
+    # ------------------------------------------------------
+    def _normalize_loss(self, name, loss, weight=1.0):
+        """DreamerV4-style loss normalization: divide a scalar loss term by a running
+        estimate of its RMS so every normalized head sits at ~unit scale, removing the
+        need for hand-tuned magnitude constants. An optional `weight` applies a priority
+        boost on top of the unit scale. KL and Var are handled separately and are NOT
+        passed through here."""
+        with torch.no_grad():
+            sq = loss.detach() ** 2
+            prev = self._loss_rms.get(name)
+            ema = sq if prev is None else self.loss_norm_decay * prev + (1.0 - self.loss_norm_decay) * sq
+            self._loss_rms[name] = ema
+            rms = ema.sqrt().clamp(min=1e-8)
+        return weight * (loss / rms)
+
+    # ------------------------------------------------------
+    def _encode_components(self, obs, ltm_reward, map_ids, grid, team, item):
+        """Encode all observation components (each input already on device)."""
+        teamitem = torch.cat((team / 100.0, item / 10.0), dim=-1)
+        return (
+            self.image_encoder(obs),
+            self.teamitem_encoder(teamitem),
+            self.ltm_reward_encoder(ltm_reward),
+            self.map_class_encoder(map_ids),
+            self.grid_encoder(grid),
+        )
+
+    # ------------------------------------------------------
+    def TrainWorldModel(self, batch_data, compute_metrics=True):
+        self.worldModelOptimizer.zero_grad(set_to_none=True)
+
+        #batch_data: dict of tensors, each [B, T, ...]
+        B, T = self.number_of_sequences, self.steps_per_sequence
+        obs_flat = batch_data["observations"].flatten(0, 1)
+        ltm_reward_flat = batch_data["ltm_rewards"].flatten(0, 1)
+        map_ids_flat = batch_data["map_ids"].flatten(0, 1)
+        grid_flat = batch_data["grids"].flatten(0, 1)
+        team_flat = batch_data["team_levels"].flatten(0, 1)
+        item_flat = batch_data["item_counts"].flatten(0, 1)
+
+        # Encoding all observation components (image, team+item, long-term reward, map class, grid)
+        enc_img, enc_teamitem, enc_ltm_reward, enc_map_class, enc_grid = self._encode_components(obs_flat, ltm_reward_flat, map_ids_flat, grid_flat, team_flat, item_flat)
+        encoder_features = torch.cat((enc_img, enc_teamitem, enc_ltm_reward, enc_map_class, enc_grid), dim=-1)
+        posterior_flat, posterior_logits_flat = self.posteriorNet(encoder_features)
+        posteriors_all = posterior_flat.view(B, T, self.latent_dim)
+        posteriors_logits_all = posterior_logits_flat.view(B, T, self.rows, self.cols)
+
+        # ----------------------------------------------------
+        # RECURRENT ROLLOUT (teacher forcing)
+        # ----------------------------------------------------
+        input_tokens = posteriors_all[:, :T - 1]
+        recurrent_states, kv_context = self.recurrentModel.forward_sequence(
+            input_tokens, batch_data["actions"][:, :T - 1], return_kv=True)
+
+        prior_sample_flat, prior_logits_flat = self.priorNet(
+            recurrent_states.reshape(-1, self.recurrent_dim))
+        priors = prior_sample_flat.view(B, T - 1, self.latent_dim)
+        priors_logits = prior_logits_flat.view(B, T - 1, self.rows, self.cols)
+
+        posteriors = posteriors_all[:, 1:]
+        posteriors_logits = posteriors_logits_all[:, 1:]
+        full_states = torch.cat((recurrent_states, posteriors), -1)
+        full_states_prior = torch.cat((recurrent_states, priors), -1)
+
+        # reward calculation
+        def _reward_loss(logits, target_scalar):
+            with torch.no_grad():
+                target_two_hot = self.two_hot.encode(target_scalar.squeeze(-1))
+            return -torch.mean(torch.sum(
+                target_two_hot * torch.log_softmax(logits, dim=-1), dim=-1))
+
+        sparse_logits = self.sparseRewardPredictor(full_states)      # [B, T-1, num_bins]
+        standard_logits = self.standardRewardPredictor(full_states)
+        sparse_reward_loss = _reward_loss(sparse_logits, batch_data["sparse_rewards"][:, :-1])
+        standard_reward_loss = _reward_loss(standard_logits, batch_data["standard_rewards"][:, :-1])
+        reward_loss = sparse_reward_loss + standard_reward_loss
+
+        # Combined team+item prediction (single decoder).
+        pred_teamitem = self.teamitemPredictor(full_states)
+        target_teamitem = torch.cat((batch_data["team_levels"][:, 1:] / 100.0, batch_data["item_counts"][:, 1:] / 10.0), dim=-1)
+        teamitem_loss = F.mse_loss(pred_teamitem, target_teamitem)
+
+        # Long memory loss.
+        pred_ltm_reward = self.ltm_reward_predictor(full_states)
+        ltm_reward_loss = self._ltm_loss(pred_ltm_reward, batch_data["ltm_rewards"][:, 1:], self.ltm_reward_pos_weight)
+
+        # Map-class prediction: 3-way category (generic / key / special).
+        pred_map_class = self.map_class_predictor(full_states)                   # [B, T-1, 3]
+        target_map_class = self.map_class_index[batch_data["map_ids"][:, 1:].long().squeeze(-1)]  # [B, T-1]
+        map_class_loss = F.cross_entropy(
+            pred_map_class.reshape(-1, MAP_CLASS_DIM), target_map_class.reshape(-1))
+
+        # Local explored grid reconstruction. Weighted BCE: cells whose target is 0
+        # (unexplored / free tile) are rare, so missing one costs `grid_zero_weight`x
+        # more; weighted mean keeps the loss at the same scale as plain BCE.
+        target_grid = batch_data["grids"][:, 1:]
+        pred_grid = self.grid_predictor(full_states)
+        grid_bce = F.binary_cross_entropy_with_logits(pred_grid, target_grid, reduction='none')
+        grid_cell_weight = 1.0 + (self.grid_zero_weight - 1.0) * (1.0 - target_grid)
+        grid_loss = (grid_bce * grid_cell_weight).sum() / grid_cell_weight.sum()
+
+        # KL loss.
+        prior_distribution = Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1)
+        prior_distribution_SG = Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1)
+        posterior_distribution = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1)
+        posterior_distribution_SG = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1)
+        prior_loss = kl_divergence(posterior_distribution_SG, prior_distribution)
+        posterior_loss = kl_divergence(posterior_distribution, prior_distribution_SG)
+        freeNats = torch.full_like(prior_loss, 1)
+        kl_loss = (1 * torch.maximum(prior_loss, freeNats) + 0.1 * torch.maximum(posterior_loss, freeNats)).mean()
+
+        # --- Latent-Space Value-Alignment Regularization (Var) ---
+        # Warm-up gated on the persisted gradient-step counter so Var progress
+        # survives restarts instead of resetting to zero each run.
+        if self.total_num_updates > self.var_warmup_steps:
+            value_logits_post = self.critic(full_states)         # V(v_t | s_t)
+            value_logits_prior = self.critic(full_states_prior)  # V(v~_t | s~_t)
+            logp_post = torch.log_softmax(value_logits_post, dim=-1)
+            logp_prior = torch.log_softmax(value_logits_prior, dim=-1)
+            p_post = logp_post.exp()
+            # KL[ sg(V(v_t|s_t)) || V(v~_t|s~_t) ] — trains the prior (dynamics) branch.
+            var_dyn = torch.sum(p_post.detach() * (logp_post.detach() - logp_prior), dim=-1)
+            # KL[ V(v_t|s_t) || sg(V(v~_t|s~_t)) ] — trains the posterior (encoder) branch.
+            var_reg = torch.sum(p_post * (logp_post - logp_prior.detach()), dim=-1)
+            var_loss = (self.var_beta_dyn * var_dyn + self.var_beta_reg * var_reg).mean()
+            beta_var = 1.0 / torch.clamp(prior_loss.mean().detach(), min=1.0)
+            var_term = beta_var * var_loss
+        else:
+            var_loss = torch.zeros((), device=self.device)
+            beta_var = torch.zeros((), device=self.device)
+            var_term = torch.zeros((), device=self.device)
+
+        # --- Barlow Twins representation loss (R2-Dreamer; replaces reconstruction) ---
+        # Views: projected latent state k_t vs. detached image embedding e_t, aligned
+        # on timesteps 1..T-1 (the steps full_states covers).
+        enc_img_target = enc_img.view(B, T, self.image_out)[:, 1:]
+        bt_loss = self._barlow_twins_loss(full_states, enc_img_target)
+
+        # World Model Loss. Every reward/aux head is normalized by its running RMS.
+        world_model_loss = (kl_loss + var_term
+                            + self._normalize_loss("reward", reward_loss, self.reward_loss_weight)
+                            + self._normalize_loss("teamitem", teamitem_loss)
+                            + self._normalize_loss("ltm_reward", ltm_reward_loss)
+                            + self._normalize_loss("map_class", map_class_loss)
+                            + self._normalize_loss("grid", grid_loss)
+                            + self._normalize_loss("barlow_twins", bt_loss, self.bt_loss_weight))
+
+        # Backward pass, gradient clipping, and optimization step.
+        world_model_loss.backward()
+        nn.utils.clip_grad_norm_(self.worldModelParameters, 10.0, norm_type=2)
+        self.worldModelOptimizer.step()
+
+        # --- Visualization decoder (detached states, own optimizer, subsampled) ---
+        # Purely for dream rendering: no gradient reaches the world model, and only
+        # `decoder_train_frames` random frames are decoded per update to keep it cheap.
+        target_imgs = batch_data["observations"][:, 1:].flatten(0, 1)
+        states_flat = full_states.detach().view(-1, self.concatenated_dim)
+        n_frames = min(self.decoder_train_frames, states_flat.shape[0])
+        frame_idx = torch.randint(0, states_flat.shape[0], (n_frames,), device=states_flat.device)
+        self.decoderOptimizer.zero_grad(set_to_none=True)
+        recon_imgs = self.decoder(states_flat[frame_idx])
+        decoder_loss = F.mse_loss(recon_imgs, target_imgs[frame_idx])
+        decoder_loss.backward()
+        nn.utils.clip_grad_norm_(self.decoder.parameters(), 10.0, norm_type=2)
+        self.decoderOptimizer.step()
+
+        # --- Curiosity head training on real states ---
+        prior_states_flat = full_states_prior.detach().view(-1, self.concatenated_dim)
+        with torch.no_grad():
+            target_curiosity = self.two_hot.encode(batch_data["curiosities"][:, :-1].squeeze(-1).reshape(-1))
+        self.curiosityHeadOptimizer.zero_grad(set_to_none=True)
+        pred_curiosity_logits = self.curiosityPredictor(prior_states_flat)
+        curiosity_loss = -torch.mean(torch.sum(
+            target_curiosity * torch.log_softmax(pred_curiosity_logits, dim=-1), dim=-1))
+        curiosity_loss.backward()
+        curiosity_grad_norm = nn.utils.clip_grad_norm_(
+            self.curiosityPredictor.parameters(), 10, norm_type=2)
+        if torch.isfinite(curiosity_grad_norm):
+            self.curiosityHeadOptimizer.step()
+        else:
+            print(f"[NaN guard] Skipped curiosity head step (grad norm: {curiosity_grad_norm.item()})")
+
+        # Dream-start priorities: sparse exploration tier-bit activations.
+        dream_priorities = batch_data["tier_events"][:, :-1].reshape(-1).detach()
+
+        metrics = {}
+        if compute_metrics:
+            metrics = {
+                "world_model_loss": world_model_loss.item(),
+                "reward_loss": reward_loss.item(),
+                "sparse_reward_loss": sparse_reward_loss.item(),
+                "standard_reward_loss": standard_reward_loss.item(),
+                "kl_loss": kl_loss.item(),
+                "var_loss": var_loss.item(),
+                "beta_var": float(beta_var),
+                "teamitem_loss": teamitem_loss.item(),
+                "ltm_reward_loss": ltm_reward_loss.item(),
+                "map_class_loss": map_class_loss.item(),
+                "grid_loss": grid_loss.item(),
+                "curiosity_loss": curiosity_loss.item(),
+                "bt_loss": bt_loss.item(),
+                "decoder_loss": decoder_loss.item(),
+            }
+        return full_states.view(-1, self.concatenated_dim).detach(), dream_priorities, kv_context, metrics
+
+    # -----------------------------------------------------
+    @staticmethod
+    def _newly_activated_mask(logits, threshold=0.5):
+        """Return a float mask [N, T] that is 1.0 at the first imagined step where any
+        LTM bit turns ON (sigmoid > threshold) after being OFF at all earlier steps."""
+        on = (torch.sigmoid(logits) > threshold)                       # [N, T, D] bool
+        prev_on = torch.cumsum(on.float(), dim=1) - on.float()         # # of ON steps before t
+        newly_on = on & (prev_on < 0.5)                                # on now, never on before
+        return newly_on.any(dim=-1).float()                            # [N, T]
+
+    def Dream(self, full_state, batch_data=None, horizon=15, dream_priorities=None,
+              compute_metrics=True, kv_context=None):
+        self.actorOptimizer.zero_grad(set_to_none=True)
+        self.criticOptimizer.zero_grad(set_to_none=True)
+        self.curiosityCriticOptimizer.zero_grad(set_to_none=True)
+
+        all_states = full_state.detach()
+        N = all_states.shape[0]
+
+        Tr = self.steps_per_sequence - 1
+        layout_ok = (N == self.number_of_sequences * Tr)
+        lead = self.dream_lead_steps
+
+        # --- K dream starts per sequence (K = self.dreams_per_sequence)
+        K = self.dreams_per_sequence
+        if layout_ok:
+            num_dreams = self.number_of_sequences * K
+            t0 = torch.randint(0, Tr, (num_dreams,), device=all_states.device)
+            seq_ids = torch.arange(self.number_of_sequences, device=all_states.device).repeat_interleave(K)
+            base_idx = seq_ids * Tr + t0
+        else:
+            num_dreams = min(self.number_of_sequences * K, N)
+            base_idx = torch.randint(0, N, (num_dreams,), device=all_states.device)
+
+        def _rewind(idx):
+            if not layout_ok or lead <= 0:
+                return idx
+            b = idx // Tr
+            t = idx % Tr
+            return b * Tr + torch.clamp(t - lead, min=0)
+
+        # --- Prioritized dream starts (sparse-reward / tier-event) ---
+        prioritized_idx = []
+        if dream_priorities is not None:
+            cur_pri = dream_priorities.detach().flatten().to(all_states.device)
+            num_cur = int(num_dreams * self.dream_priority_fraction)
+            if num_cur > 0 and torch.count_nonzero(cur_pri) > 0:
+                prioritized_idx.append(_rewind(
+                    torch.multinomial(cur_pri + 1e-8, num_cur, replacement=True)))
+
+        if batch_data is not None and "sparse_rewards" in batch_data:
+            rew_pri = batch_data["sparse_rewards"][:, :-1].reshape(-1).detach().to(all_states.device)
+            rew_pri = rew_pri.clamp(min=0.0)  # multinomial weights must be non-negative
+            num_rew = int(num_dreams * self.dream_reward_priority_fraction)
+            if num_rew > 0 and torch.count_nonzero(rew_pri) > 0:
+                prioritized_idx.append(_rewind(
+                    torch.multinomial(rew_pri + 1e-8, num_rew, replacement=True)))
+
+        if prioritized_idx:
+            pri_idx = torch.cat(prioritized_idx)[:num_dreams]
+            sel_idx = torch.cat([base_idx[:num_dreams - pri_idx.shape[0]], pri_idx])
+        else:
+            sel_idx = base_idx
+        start_states = all_states[sel_idx]
+
+
+        # --- TSSM context: each dream start (b, t) gets its real replay history
+        if layout_ok and kv_context is not None:
+            cache = self.recurrentModel.make_cache(num_dreams, Tr + horizon, start_states.device)
+            cache.prefill(kv_context, sel_idx // Tr, lengths=(sel_idx % Tr) + 1)
+        else:
+            cache = self.recurrentModel.make_cache(num_dreams, horizon + 1, start_states.device)
+
+        # --- Imagination rollout (transformer decodes through the KV cache) ---
+        full_states = [start_states]
+        log_probabilities, entropies, actions_stack = [], [], []
+        curr_state = start_states
+        recurrent_state, latent_state = torch.split(curr_state, [self.recurrent_dim, self.latent_dim], -1)
+        for _ in range(horizon):
+            action, logprob, entropy = self.actor(curr_state)
+            with torch.no_grad():
+                recurrent_state = self.recurrentModel.forward_step(latent_state, action, cache)
+                # Keep a diverging rollout from poisoning the actor / critics / reward heads.
+                recurrent_state = torch.nan_to_num(recurrent_state, nan=0.0, posinf=1e4, neginf=-1e4)
+                latent_state, _ = self.priorNet(recurrent_state, unimix=False)
+            curr_state = torch.cat((recurrent_state, latent_state), -1)
+            full_states.append(curr_state)
+            log_probabilities.append(logprob)
+            entropies.append(entropy)
+            actions_stack.append(action)
+
+        full_states = torch.stack(full_states, dim=1)
+        log_probabilities = torch.stack(log_probabilities, dim=1)
+        entropies = torch.stack(entropies, dim=1)
+        actions_stack = torch.stack(actions_stack, dim=1)
+
+        # --- Predicted rewards (single head each) and curiosity ---
+        with torch.no_grad():
+            imagined_steps = full_states[:, 1:]
+            predicted_sparse = self.two_hot.decode(self.sparseRewardPredictor(imagined_steps)).squeeze(-1)
+            predicted_standard = self.two_hot.decode(self.standardRewardPredictor(imagined_steps)).squeeze(-1)
+            predicted_curiosity = self.two_hot.decode(self.curiosityPredictor(imagined_steps)).squeeze(-1)
+
+            # --- Anti-duplication gate  --
+            reward_ltm_logits = self.ltm_reward_predictor(imagined_steps)  # [N, T, D]
+            predicted_sparse = predicted_sparse  * self._newly_activated_mask(reward_ltm_logits, self.ltm_gate_threshold)
+            predicted_rewards = predicted_sparse + predicted_standard
+            grid_logits = self.grid_predictor(imagined_steps)             # [N, T, GRID_DIM]
+            center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
+            # Soft gate: scale curiosity by the predicted probability the center
+            # tile is NEW (1 - p_explored) instead of a hard threshold, so relative
+            # novelty differences survive even when the predictor is miscalibrated.
+            tile_gate = 1.0 - center_explored_prob
+            predicted_curiosity = predicted_curiosity * tile_gate
+
+        # --- Critic values (two-hot) ---
+        imagined_states = full_states.detach()
+        critic_logits = self.critic(imagined_states)
+        curiosity_critic_logits = self.curiosity_critic(imagined_states)
+        online_values = self.two_hot.decode(critic_logits.detach()).squeeze(-1)
+        online_curiosity_values = self.two_hot.decode(curiosity_critic_logits.detach()).squeeze(-1)
+
+        # --- Lambda returns ---
+        with torch.no_grad():
+            continues = torch.full_like(predicted_rewards, self.continue_discount)
+            lambda_values = self.computeLambdaValues(predicted_rewards, online_values, continues)
+            curiosity_lambda_values = self.computeLambdaValues(predicted_curiosity, online_curiosity_values, continues)
+
+        # --- Advantages (raw; PMPO only uses their sign, so no normalization) ---
+        reward_advantages = lambda_values - online_values[:, :-1].detach()
+        curiosity_advantages = curiosity_lambda_values - online_curiosity_values[:, :-1].detach()
+
+        # --- Actor loss (PMPO) ---
+        actor_loss = (self._pmpo_loss(reward_advantages, log_probabilities)
+                      + self.curiosity_scale * self._pmpo_loss(curiosity_advantages, log_probabilities)
+                      - self.entropy_scale * entropies.mean())
+
+        # --- Reward critic loss (CE to lambda returns + EMA KL anchor) ---
+        critic_logits_to_train = critic_logits[:, :-1]
+        target_values_two_hot = self.two_hot.encode(lambda_values.detach())
+        critic_loss_main = -torch.mean(torch.sum(target_values_two_hot * torch.log_softmax(critic_logits_to_train, dim=-1), dim=-1))
+        with torch.no_grad():
+            ema_critic_logits = self.ema_critic(imagined_states[:, :-1])
+            ema_probs = torch.softmax(ema_critic_logits, dim=-1)
+        critic_ema_reg = torch.mean(torch.sum(
+            ema_probs * (torch.log_softmax(ema_critic_logits, dim=-1) - torch.log_softmax(critic_logits_to_train, dim=-1)), dim=-1))
+        critic_loss = critic_loss_main + critic_ema_reg
+
+        # --- Curiosity critic loss (CE to lambda returns) ---
+        curiosity_critic_logits_to_train = curiosity_critic_logits[:, :-1]
+        target_curiosity_values_two_hot = self.two_hot.encode(curiosity_lambda_values.detach())
+        curiosity_critic_loss = -torch.mean(torch.sum(
+            target_curiosity_values_two_hot * torch.log_softmax(curiosity_critic_logits_to_train, dim=-1), dim=-1))
+
+        # --- Optimization ---
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0, norm_type=2)
+        self.criticOptimizer.step()
+
+        curiosity_critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.curiosity_critic.parameters(), 1.0, norm_type=2)
+        self.curiosityCriticOptimizer.step()
+
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0, norm_type=2)
+        self.actorOptimizer.step()
+
+        # --- EMA reward-critic update ---
+        with torch.no_grad():
+            ema_params = list(self.ema_critic.parameters())
+            src_params = list(self.critic.parameters())
+            torch._foreach_mul_(ema_params, self.critic_ema_decay)
+            torch._foreach_add_(ema_params, src_params, alpha=1.0 - self.critic_ema_decay)
+
+        metrics = {}
+        if compute_metrics:
+            metrics = {
+                "actor_loss": actor_loss.item(),
+                "critic_loss": critic_loss.item(),
+                "curiosity_critic_loss": curiosity_critic_loss.item(),
+                "entropies": entropies.mean().item(),
+                "log_probabilities": log_probabilities.mean().item(),
+                "reward_advantages": reward_advantages.mean().item(),
+                "advantages": reward_advantages.mean().item(),  # alias for policy.py logging
+                "curiosity_advantages": curiosity_advantages.mean().item(),
+                "advantage_pos_fraction": (reward_advantages >= 0).float().mean().item(),
+                "critic_values": online_values.mean().item(),
+                "curiosity_critic_values": online_curiosity_values.mean().item(),
+                "dream_mean_curiosity": predicted_curiosity.mean().item(),
+            }
+
+        # --- Combined advantage, scaled exactly like the actor loss mixes the two PMPO terms ---
+        combined_advantages = ((1.0 - self.curiosity_scale) * reward_advantages + self.curiosity_scale * curiosity_advantages)  # [B, horizon]
+
+        # --- Package representative trajectories for visualization ---
+        def pack(idx, metric, label):
+            return (metric,
+                    full_states[idx].detach().cpu(),
+                    predicted_rewards[idx].detach().cpu(),
+                    lambda_values[idx].detach().cpu(),
+                    actions_stack[idx].detach().cpu(),
+                    reward_advantages[idx].detach().cpu(),
+                    curiosity_advantages[idx].detach().cpu(),
+                    combined_advantages[idx].detach().cpu(),
+                    label)
+
+        trajectory_advantages = combined_advantages.sum(dim=1)
+        best_idx = torch.argmax(trajectory_advantages).item()
+        rand_idx = torch.randint(0, trajectory_advantages.shape[0], (1,)).item()
+
+        best_dream_data = pack(best_idx, trajectory_advantages[best_idx].item(), "MaxAdvantage")
+        rand_dream_data = pack(rand_idx, trajectory_advantages[rand_idx].item(), "Random")
+        return metrics, best_dream_data, rand_dream_data
+
+    # ------------------------------------------------------
+    @torch.no_grad()
+    def Play_the_game(self, number_of_episodes_per_env=1, epsilon=0.05):
+        num_envs = len(self.envs)
+        episodes_completed = [0] * num_envs
+        scores = []
+        curiosity_scores = []
+        current_rewards = [0.0] * num_envs
+        current_curiosities = [0.0] * num_envs
+        local_buffers = [[] for _ in range(num_envs)]
+        maps_visited = [set() for _ in range(num_envs)]
+
+        recurrent_state = torch.zeros((num_envs, self.recurrent_dim), device=self.device)
+        context = self.recurrentModel.make_cache(num_envs, self.context_length, self.device)
+
+        observations, ltm_rewards, map_ids, grids, team_levels, item_counts = [], [], [], [], [], []
+        for obs, info in self.envs.reset():  # all emulators reset in parallel
+            observations.append(obs)
+            ltm_rewards.append(np.array(info["ltm_reward"], dtype=np.float32))
+            map_ids.append(np.array([info["map_id"]], dtype=np.float32))
+            grids.append(np.array(info["grid"], dtype=np.float32))
+            team_levels.append(np.array(info["team_levels"], dtype=np.float32))
+            item_counts.append(np.array(info["item_counts"], dtype=np.float32))
+
+        while min(episodes_completed) < number_of_episodes_per_env:
+            obs_tensor = (torch.from_numpy(np.array(observations)).float() / 255.0).to(self.device)
+            ltm_reward_tensor = torch.from_numpy(np.array(ltm_rewards)).float().to(self.device)
+            map_ids_tensor = torch.from_numpy(np.array(map_ids)).to(self.device)
+            grid_tensor = torch.from_numpy(np.array(grids)).float().to(self.device)
+            team_tensor = torch.from_numpy(np.array(team_levels)).float().to(self.device)
+            item_tensor = torch.from_numpy(np.array(item_counts)).float().to(self.device)
+
+            enc_img, enc_teamitem, enc_ltm_reward, enc_map_class, enc_grid = self._encode_components(
+                obs_tensor, ltm_reward_tensor, map_ids_tensor, grid_tensor, team_tensor, item_tensor)
+
+            posterior_input = torch.cat((enc_img, enc_teamitem,
+                                         enc_ltm_reward, enc_map_class, enc_grid), -1)
+            latent_state, _ = self.posteriorNet(posterior_input)
+            action_onehot, _, _ = self.actor(torch.cat((recurrent_state, latent_state), -1))
+
+            if epsilon > 0.0:
+                override = torch.rand(num_envs, device=self.device) < epsilon
+                if override.any():
+                    rand_actions = torch.randint(0, self.action_dim, (int(override.sum().item()),), device=self.device)
+                    action_onehot[override] = F.one_hot(rand_actions, self.action_dim).float()
+
+            action = action_onehot
+            # Append the executed token u_t=(z_t, a_t); the transformer returns h_{t+1}.
+            recurrent_state = self.recurrentModel.forward_step(latent_state, action, context)
+            action_idxs = torch.argmax(action, dim=-1).cpu().numpy()
+            actions_for_buffer = action.cpu().numpy().astype(np.float32)
+
+            # Step every still-active emulator at once (they run concurrently).
+            active = [episodes_completed[i] < number_of_episodes_per_env for i in range(num_envs)]
+            results = self.envs.step(action_idxs, active=active)
+
+            envs_to_reset = []
+            for i in range(num_envs):
+                if not active[i]:
+                    continue
+                next_observation, reward, terminated, truncated, next_info = results[i]
+                done = terminated or truncated
+                for msg in next_info.get("logs", ()):
+                    print(f"    [Env {i+1}] {msg}")
+                self.total_num_steps += 1
+                current_rewards[i] += reward
+                current_map = next_info["coord"][0]
+                if current_map not in maps_visited[i] and current_map in MAP_NAMES:
+                    print(f"    [Env {i+1}] \033[1;96mEntered {MAP_NAMES[current_map]} for the first time\033[0m")
+                maps_visited[i].add(current_map)
+                sparse_reward = next_info.get("sparse_reward", 0.0)
+                standard_reward = next_info.get("standard_reward", 0.0)
+                curiosity = next_info.get("curiosity", 0.0)
+                tier_event = next_info.get("tier_event", 0.0)
+                current_curiosities[i] += curiosity
+
+                local_buffers[i].append((
+                    observations[i].copy(), ltm_rewards[i].copy(), map_ids[i].copy(),
+                    grids[i].copy(), item_counts[i].copy(), team_levels[i].copy(),
+                    actions_for_buffer[i].copy(), sparse_reward, standard_reward,
+                    curiosity, tier_event))
+
+                observations[i] = next_observation
+                ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
+                map_ids[i] = np.array([next_info["map_id"]], dtype=np.float32)
+                grids[i] = np.array(next_info["grid"], dtype=np.float32)
+                team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
+                item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
+
+                if done:
+                    print(f"    [Env {i+1}] Episode done | Reward: {current_rewards[i]:.2f} | "
+                          f"Curiosity: {current_curiosities[i]:.3f} | "
+                          f"Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
+                    maps_visited[i] = set()
+                    with self.buffer.lock:  # atomic flush vs. concurrent sampling
+                        for transition in local_buffers[i]:
+                            self.buffer.add(*transition)
+                        local_buffers[i].clear()
+                        self.buffer.end_episode()
+                    scores.append(current_rewards[i])
+                    curiosity_scores.append(current_curiosities[i])
+                    self.total_num_episodes += 1
+                    episodes_completed[i] += 1
+
+                    if episodes_completed[i] < number_of_episodes_per_env:
+                        envs_to_reset.append(i)
+                        current_rewards[i] = 0.0
+                        current_curiosities[i] = 0.0
+                        recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
+                        context.reset_rows(i)  # clear the transformer's token history
+
+            # Reset any finished envs (deferred out of the result loop; rare vs. steps).
+            for i in envs_to_reset:
+                next_obs, next_info = self.envs.reset_one(i)
+                observations[i] = next_obs
+                ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
+                map_ids[i] = np.array([next_info["map_id"]], dtype=np.float32)
+                grids[i] = np.array(next_info["grid"], dtype=np.float32)
+                team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
+                item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
+
+
+        for i in range(num_envs):
+            if local_buffers[i]:
+                with self.buffer.lock:  # atomic flush vs. concurrent sampling
+                    for transition in local_buffers[i]:
+                        self.buffer.add(*transition)
+                    local_buffers[i].clear()
+                    self.buffer.end_episode()
+
+        avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+        avg_curiosity = round(sum(curiosity_scores) / len(curiosity_scores), 4) if curiosity_scores else 0.0
+        return avg_score, avg_curiosity
+
+    # ------------------------------------------------------
+    # CHECKPOINTING 
+    # ------------------------------------------------------
+    _CHECKPOINT_MODULES = [
+        'recurrentModel', 'posteriorNet', 'priorNet', 'sparseRewardPredictor', 'standardRewardPredictor',
+        'curiosityPredictor',
+        'image_encoder', 'teamitem_encoder', 'ltm_reward_encoder', 'map_class_encoder', 'grid_encoder',
+        'teamitemPredictor', 'ltm_reward_predictor', 'map_class_predictor', 'grid_predictor',
+        'actor', 'critic', 'ema_critic', 'curiosity_critic',
+        'decoder', 'bt_projector',
+    ]
+    _CHECKPOINT_OPTIMIZERS = [
+        'worldModelOptimizer', 'actorOptimizer', 'criticOptimizer',
+        'curiosityCriticOptimizer', 'curiosityHeadOptimizer', 'decoderOptimizer',
+    ]
+
+    def saveCheckpoints(self, path):
+        directory = os.path.dirname(path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
+        names = self._CHECKPOINT_MODULES + self._CHECKPOINT_OPTIMIZERS
+        checkpoint = {name: getattr(self, name).state_dict() for name in names}
+        checkpoint.update({
+            'total_num_episodes': self.total_num_episodes,
+            'total_num_steps': self.total_num_steps,
+            'total_num_updates': self.total_num_updates,
+        })
+        torch.save(checkpoint, path)
+        print(f"Saved checkpoint: {path}")
+
+        buffer_path = os.path.join(directory, "replay_buffer.buffer") if directory else "replay_buffer.buffer"
+        print("Saving replay buffer...")
+        self.buffer.save(buffer_path)
+        return 0
+
+    def loadCheckpoints(self, path=None):
+        if path is None:
+            checkpoint_files = glob.glob("checkpoints/pokemon_model_R*_G*.pt")
+            if not checkpoint_files:
+                path = 'model.pt'
+            else:
+                try:
+                    path = max(checkpoint_files, key=lambda x: int(x.split('_G')[-1].split('.pt')[0]))
+                except Exception:
+                    path = max(checkpoint_files, key=os.path.getctime)
+
+        if not os.path.exists(path):
+            print(f"No checkpoint found at {path}, starting from scratch.")
+            return 0
+
+        checkpoint = torch.load(path, map_location=self.device)
+        # worldModelOptimizer is intentionally not reloaded (kept fresh, matching prior behavior).
+        skip_optimizers = {'worldModelOptimizer'}
+        for name in self._CHECKPOINT_MODULES + self._CHECKPOINT_OPTIMIZERS:
+            if name in skip_optimizers or name not in checkpoint:
+                if name not in checkpoint:
+                    print(f"[load] '{name}' not in checkpoint -> fresh init.")
+                continue
+            try:
+                getattr(self, name).load_state_dict(checkpoint[name])
+            except Exception as e:
+                print(f"[load] '{name}' shape/key mismatch -> fresh init ({e}).")
+
+        self.total_num_episodes = checkpoint.get('total_num_episodes', 0)
+        self.total_num_steps = checkpoint.get('total_num_steps', 0)
+        self.total_num_updates = checkpoint.get('total_num_updates', 0)
+
+        directory = os.path.dirname(path)
+        buffer_path = os.path.join(directory, "replay_buffer.buffer") if directory else "replay_buffer.buffer"
+        if os.path.exists(buffer_path):
+            print("Loading replay buffer...")
+            self.buffer.load(buffer_path)
+        return 0
+
+    # ------------------------------------------------------
+    # DREAM VISUALIZATION (decoded frames + per-step reward/curiosity advantages)
+    # ------------------------------------------------------
+    @torch.no_grad()
+    def visualize_single_dream(self, best_states, best_rewards, best_values, best_actions,
+                               reward_advantages=None, curiosity_advantages=None,
+                               combined_advantages=None, title_prefix="Dream",
+                               label=None, max_advantage=None, pdf=None):
+        best_states_device = best_states.to(self.device)
+        grid_logits = self.grid_predictor(best_states_device)
+        center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
+        tile_gate = 1.0 - center_explored_prob  # soft gate (matches Dream)
+        curiosities = (
+            self.two_hot.decode(self.curiosityPredictor(best_states_device)).squeeze(-1) * tile_gate
+        ).cpu()
+
+        decoded_imgs = self.decoder(best_states_device).clamp(0.0, 1.0).cpu()  # [horizon, 3, 64, 64]
+
+        horizon = best_states.shape[0]
+        action_names = ["UP", "DOWN", "LEFT", "RIGHT", "A", "B"]
+        action_icons = {"UP": "▲ UP", "DOWN": "▼ DN", "LEFT": "◀ LT", "RIGHT": "▶ RT", "A": "A", "B": "B"}
+
+        # Taller info row + larger figure so the per-step numbers are easy to read.
+        fig, axes = plt.subplots(2, horizon, figsize=(horizon * 2.7, 7.5), facecolor='#0d1117', dpi=120,
+                                 gridspec_kw={'height_ratios': [1.4, 1.3]})
+        # Title: dream type + its (max) combined advantage.
+        dream_type = label if label is not None else "Dream"
+        adv_value = max_advantage
+        if adv_value is None and combined_advantages is not None:
+            adv_value = combined_advantages.sum().item()
+        title_txt = f'{dream_type} Dream'
+        if adv_value is not None:
+            title_txt += f'  —  Advantage = {adv_value:+.3f}'
+        fig.suptitle(title_txt, color='#58a6ff', fontsize=20, fontweight='bold', y=0.99)
+        if horizon == 1:
+            axes = np.expand_dims(axes, axis=1)
+
+        def _col(v):
+            return '#3fb950' if v > 0 else ('#ff7b72' if v < 0 else '#8b949e')
+
+        for i in range(horizon):
+            ax_img, ax_info = axes[0, i], axes[1, i]
+            ax_img.imshow(decoded_imgs[i].permute(1, 2, 0).numpy())
+            ax_img.axis('off')
+            for spine in ax_img.spines.values():
+                spine.set_visible(True); spine.set_edgecolor('#30363d'); spine.set_linewidth(1.0)
+
+            ax_info.set_xlim(0, 1); ax_info.set_ylim(0, 1); ax_info.axis('off'); ax_info.set_facecolor('#161b22')
+            for spine in ax_info.spines.values():
+                spine.set_visible(True); spine.set_edgecolor('#30363d'); spine.set_linewidth(0.5)
+
+            if i < horizon - 1:
+                step_reward = best_rewards[i].item()
+                step_cur = curiosities[i].item()
+                action_idx = torch.argmax(best_actions[i]).item()
+                action_str = action_names[action_idx] if action_idx < len(action_names) else str(action_idx)
+                icon = action_icons.get(action_str, action_str)
+
+                # Per step: action, reward, curiosity, combined (scaled) advantage.
+                lines = [
+                    (icon, '#58a6ff', 17),
+                    (f'r: {step_reward:+.2f}', _col(step_reward), 15),
+                    (f'c: {step_cur:+.4f}', '#d1f1a5', 15),
+                ]
+                if combined_advantages is not None:
+                    a_comb = combined_advantages[i].item()
+                    lines.append((f'A: {a_comb:+.3f}', _col(a_comb), 16))
+
+                y = 0.90
+                for txt, col, fsize in lines:
+                    ax_info.text(0.5, y, txt, ha='center', va='center', fontsize=fsize,
+                                 fontweight='bold', color=col,
+                                 fontfamily='monospace', transform=ax_info.transAxes)
+                    y -= 0.24
+            else:
+                ax_info.text(0.5, 0.72, 'END', ha='center', va='center', fontsize=18,
+                             fontweight='bold', color='#8b949e', transform=ax_info.transAxes)
+                ax_info.text(0.5, 0.40, f'c: {curiosities[i].item():+.4f}', ha='center', va='center',
+                             fontsize=15, fontweight='bold', color='#d1f1a5',
+                             fontfamily='monospace', transform=ax_info.transAxes)
+
+        plt.subplots_adjust(top=0.90, bottom=0.04, hspace=0.12)
+        # Save to the PdfPages handle if given, otherwise show interactively.
+        if pdf is not None:
+            pdf.savefig(fig, facecolor=fig.get_facecolor())
+        else:
+            plt.show()
+        plt.close(fig)
