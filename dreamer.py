@@ -540,8 +540,7 @@ class Buffer(object):
     def __init__(self, device, capacity=800000, actionSize=6,
                  ltm_reward_dim=LTM_REWARD_DIM,
                  item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM,
-                 reward_sample_fraction=0.10, curiosity_sample_fraction=0.10,
-                 recent_sample_fraction=0.20):
+                 reward_sample_fraction=0.10, curiosity_sample_fraction=0.10):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
@@ -569,7 +568,6 @@ class Buffer(object):
         self._curiosity_positions = set()
         self.reward_sample_fraction = reward_sample_fraction
         self.curiosity_sample_fraction = curiosity_sample_fraction
-        self.recent_sample_fraction = recent_sample_fraction
 
     def add(self, observation, ltm_reward, grid, item_count, team_level, action,
             sparse_reward, standard_reward, curiosity, tier_event):
@@ -638,32 +636,8 @@ class Buffer(object):
         if N < sequenceSize:
             return None
 
-        num_recent = int(round(batchSize * self.recent_sample_fraction))
-        num_all = batchSize - num_recent
+        num_all = batchSize
         sample_indices = []
-
-        # `recent_sample_fraction` of the batch comes from a recent window, the
-        # remainder uniformly across the whole buffer.
-        if num_recent > 0:
-            effective_window = min(15000 * self.num_envs, N)
-            max_offset = effective_window - sequenceSize
-            if max_offset >= 0:
-                seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
-
-                def draw_recent(n):
-                    offsets = torch.randint(0, max_offset + 1, (n, 1))
-                    recent_starts = (self.index - sequenceSize - offsets) % self.capacity
-                    return (recent_starts + seq_offsets) % self.capacity
-
-                rows = draw_recent(num_recent)
-                for _ in range(8):  # redraw windows that cross an episode boundary
-                    bad = ~self._same_episode(rows)
-                    if not bad.any():
-                        break
-                    rows[bad] = draw_recent(int(bad.sum()))
-                sample_indices.append(rows)
-            else:
-                num_all += num_recent
 
         # Bias-aware injection: force a fraction of the batch to cover reward / tier-event slots.
         if self._reward_positions and self.reward_sample_fraction > 0.0:
@@ -759,7 +733,6 @@ class Buffer(object):
         print("=" * 50)
         print(f"  Buffer Fill : {valid:,} / {self.capacity:,} ({100.0 * valid / self.capacity:.2f}%)")
         print(f"  Active Environments : {self.num_envs}")
-        print(f"  Recent Sampling Window Size : {20000 * self.num_envs:,} steps")
         print("=" * 50 + "\n")
 
 
@@ -819,7 +792,7 @@ class Dreamer:
                  buffer_size=1500000,
                  team_dim=6, item_dim=2, curiosity_scale=0.25, mlp_dim=1024,
                  reward_sample_fraction=0.05, curiosity_sample_fraction=0.05,
-                 entropy_scale=0.0015, recent_sample_fraction=0.35,
+                 entropy_scale=0.0015,
                  teamitem_out=128, ltm_reward_out=512, grid_out=128,
                  dream_priority_fraction=0.05, dream_reward_priority_fraction=0.05,
                  dream_lead_steps=10, ltm_gate_threshold=0.4, grid_gate_threshold=0.5,
@@ -862,7 +835,6 @@ class Dreamer:
         self.buffer_capacity = buffer_size
         self.reward_sample_fraction = reward_sample_fraction
         self.curiosity_sample_fraction = curiosity_sample_fraction
-        self.recent_sample_fraction = recent_sample_fraction
         self.curiosity_scale = curiosity_scale
         self.envs = envs
 
@@ -947,7 +919,6 @@ class Dreamer:
             num_envs=len(envs), grid_dim=GRID_DIM,
             reward_sample_fraction=self.reward_sample_fraction,
             curiosity_sample_fraction=self.curiosity_sample_fraction,
-            recent_sample_fraction=self.recent_sample_fraction,
         )
 
         # --- World-model parameter group ---

@@ -43,7 +43,6 @@ class Policy:
         steps_per_sequence=96,
         dreams_per_sequence=8,
         buffer_size=1000000,
-        recent_sample_fraction=0.25,
         team_dim=6, item_dim=2,
         teamitem_out=128, ltm_reward_out=512, grid_out=128,
         mlp_dim=1024,
