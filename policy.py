@@ -2,7 +2,6 @@ import os
 import csv
 import glob
 import random
-import threading
 import numpy as np
 import torch
 
@@ -42,17 +41,17 @@ class Policy:
         number_of_sequences=64,    
         steps_per_sequence=96,
         dreams_per_sequence=8,
-        buffer_size=1000000,
+        buffer_size=1250000,
         team_dim=6, item_dim=2,
         teamitem_out=128, ltm_reward_out=512, grid_out=128,
         mlp_dim=1024,
         curiosity_scale=0.25, # scale of curiosity reward relative to environment reward
         pmpo_alpha=0.5,
         entropy_scale=0.1,
-        critic_ema_decay=0.90,
+        critic_ema_decay=0.97,
         bt_alpha=5e-4,             # off-diagonal (redundancy) weight, R2-Dreamer Table 2
         decoder_train_frames=512,  # detached viz-decoder frames per update (visualization only)
-        continue_discount=0.997,
+        continue_discount=0.990,
         dream_priority_fraction=0.025,
         dream_reward_priority_fraction=0.025,
         reward_sample_fraction=0.025,
@@ -119,22 +118,10 @@ class Policy:
             random_dreams_of_episode = []
             wm_metrics = {}
 
-            # --- Environment collection overlapped with training ---
-            collect_result = {}
-
-            def _collect():
-                try:
-                    collect_result["out"] = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
-                except Exception as e:
-                    print(f"[!] Collector thread failed: {e!r}")
-                    collect_result["out"] = (0.0, 0.0)
-
-            collector = threading.Thread(target=_collect, daemon=True)
-            print("[*] Stepping environment in the background (overlapped with training)...")
-            collector.start()
-
-            # Prefetch batches on a background thread (concurrent flushes are
-            # handled by buffer.lock).
+            # Prefetch training batches on a background thread (overlaps the CPU
+            # gather with GPU training). Episode collection now runs sequentially
+            # after the training phase, so the episode is played with the freshly
+            # updated policy instead of one that is a full episode behind.
             prefetcher = BatchPrefetcher(
                 self.dreamer.buffer,
                 batch_size=self.dreamer.number_of_sequences,
@@ -187,10 +174,9 @@ class Policy:
                 # Keep at most 10 dream files; the oldest is replaced first.
                 dream_path = self._save_dreams_to_file(dreams_to_visualize)
                 print(f"[*] Saved {len(dreams_to_visualize)} dreams to {dream_path}")
-            # --- Wait for the background episode started at the top of this phase ---
-            print(f"[*] Waiting for the background episode to finish...")
-            collector.join()
-            avg_score, avg_curiosity = collect_result["out"]
+            # --- Play one episode with the freshly updated policy ---
+            print(f"[*] Training phase complete. Playing one episode with the updated policy...")
+            avg_score, avg_curiosity = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
 
             self.dreamer.buffer.print_diagnostics()
             

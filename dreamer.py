@@ -545,9 +545,6 @@ class Buffer(object):
         self.capacity = capacity
         self.num_envs = num_envs
         self._pin = torch.cuda.is_available()
-        # Guards episode flushes (writes) against concurrent sample() calls now that
-        # collection runs on a background thread overlapped with training.
-        self.lock = threading.Lock()
         self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
         self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
         self.grids = torch.empty((capacity, grid_dim), dtype=torch.uint8, device='cpu')
@@ -626,12 +623,6 @@ class Buffer(object):
         return rows
 
     def sample(self, batchSize, sequenceSize):
-        """Thread-safe wrapper: the lock keeps gathered windows consistent while the
-        collector thread flushes finished episodes into the buffer."""
-        with self.lock:
-            return self._sample(batchSize, sequenceSize)
-
-    def _sample(self, batchSize, sequenceSize):
         N = self.capacity if self.full else self.index
         if N < sequenceSize:
             return None
@@ -741,8 +732,8 @@ class Buffer(object):
 # ==========================================================
 class BatchPrefetcher:
     """Samples pinned CPU batches on a background thread so the gather overlaps GPU
-    training. Safe alongside the collector thread: buffer.sample() and episode
-    flushes are serialized by buffer.lock."""
+    training. Runs only during the training phase; episode collection happens
+    sequentially afterward, so no buffer writes occur while it samples."""
 
     def __init__(self, buffer, batch_size, sequence_size, depth=3):
         self.buffer = buffer
@@ -1113,7 +1104,7 @@ class Dreamer:
         teamitem_loss = teamitem_loss*100
         ltm_reward_loss = ltm_reward_loss*100
         grid_loss = grid_loss*100
-
+        var_term = var_term*1000
         # World Model Loss
         world_model_loss = (kl_loss + var_term
                             + reward_loss
@@ -1166,7 +1157,7 @@ class Dreamer:
                 "sparse_reward_loss": sparse_reward_loss.item(),
                 "standard_reward_loss": standard_reward_loss.item(),
                 "kl_loss": kl_loss.item(),
-                "var_loss": var_loss.item(),
+                "var_loss": var_term.item(),
                 "beta_var": float(beta_var),
                 "teamitem_loss": teamitem_loss.item(),
                 "ltm_reward_loss": ltm_reward_loss.item(),
@@ -1479,11 +1470,10 @@ class Dreamer:
                           f"Curiosity: {current_curiosities[i]:.3f} | "
                           f"Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
                     maps_visited[i] = set()
-                    with self.buffer.lock:  # atomic flush vs. concurrent sampling
-                        for transition in local_buffers[i]:
-                            self.buffer.add(*transition)
-                        local_buffers[i].clear()
-                        self.buffer.end_episode()
+                    for transition in local_buffers[i]:
+                        self.buffer.add(*transition)
+                    local_buffers[i].clear()
+                    self.buffer.end_episode()
                     scores.append(current_rewards[i])
                     curiosity_scores.append(current_curiosities[i])
                     self.total_num_episodes += 1
@@ -1508,11 +1498,10 @@ class Dreamer:
 
         for i in range(num_envs):
             if local_buffers[i]:
-                with self.buffer.lock:  # atomic flush vs. concurrent sampling
-                    for transition in local_buffers[i]:
-                        self.buffer.add(*transition)
-                    local_buffers[i].clear()
-                    self.buffer.end_episode()
+                for transition in local_buffers[i]:
+                    self.buffer.add(*transition)
+                local_buffers[i].clear()
+                self.buffer.end_episode()
 
         avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
         avg_curiosity = round(sum(curiosity_scores) / len(curiosity_scores), 4) if curiosity_scores else 0.0
