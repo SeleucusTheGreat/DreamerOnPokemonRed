@@ -1,1 +1,0 @@
-envSteps,gradientSteps,totalReward,totalCuriosity,worldModelLoss,barlowTwinsLoss,rewardPredictorLoss,klLoss,teamItemLoss,ltmRewardLoss,mapClassLoss,gridLoss,varLoss,curiosityLoss,actorLoss,entropies,criticLoss,curiosityCriticLoss,advantages,curiosityAdvantages,criticValues,curiosityCriticValues

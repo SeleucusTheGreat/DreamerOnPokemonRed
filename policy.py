@@ -18,7 +18,7 @@ class Policy:
         # Run-control parameters.
         self.total_num_episodes = 10000
         self.training_per_episodes = 500
-        self.seed = 77
+        self.seed = 42
         self.checkpoint_interval = 2   # Save every N episodes
         self.dream_horizon = 15        # number of env steps imagined per dream
 
@@ -32,26 +32,25 @@ class Policy:
         self.dreamer_config = dict(
         action_dim=self.action_dim,
 
-        recurrent_dim=512,        # size of recurrent state (h) in TSSM
-        tssm_layers=6,             # 4 -> 8: depth helps long-range dynamics most
-        tssm_heads=4,              # head_dim=128 at d_model=1024 (leave as-is)
+        recurrent_dim=1024,        # size of recurrent state (h) in TSSM
+        tssm_layers=8,             # 4 -> 8: depth helps long-range dynamics most
+        tssm_heads=8,              # head_dim=128 at d_model=1024 (leave as-is)
         tssm_kv_heads=2,           # 4:1 GQA
-        tssm_ffn=1365,             # ~8/3 * 1024 (correct for this width)
-        context_length=80,        # 96 -> 192: longer coherence horizon in imagination
-        rows=32, cols=32,
+        tssm_ffn=2816,             # ~8/3 * 1024 (correct for this width)
+        context_length=80,         
+        rows=40, cols=40,
         number_of_sequences=64,    
         steps_per_sequence=96,
         dreams_per_sequence=8,
         buffer_size=1000000,
         recent_sample_fraction=0.25,
         team_dim=6, item_dim=2,
-        teamitem_out=128, ltm_reward_out=256, map_class_out=256, grid_out=128,
+        teamitem_out=128, ltm_reward_out=512, grid_out=128,
         mlp_dim=1024,
-        curiosity_scale=0.4, # scale of curiosity reward relative to environment reward
+        curiosity_scale=0.25, # scale of curiosity reward relative to environment reward
         pmpo_alpha=0.5,
-        entropy_scale=0.15,
+        entropy_scale=0.1,
         critic_ema_decay=0.90,
-        bt_loss_weight=10.0,       # priority boost of the Barlow Twins repr. loss (replaces decoder recon)
         bt_alpha=5e-4,             # off-diagonal (redundancy) weight, R2-Dreamer Table 2
         decoder_train_frames=512,  # detached viz-decoder frames per update (visualization only)
         continue_discount=0.997,
@@ -77,7 +76,7 @@ class Policy:
         
         headers =[
             "envSteps", "gradientSteps", "totalReward", "totalCuriosity",
-            "worldModelLoss", "barlowTwinsLoss", "rewardPredictorLoss", "klLoss", "teamItemLoss", "ltmRewardLoss", "mapClassLoss", "gridLoss", "varLoss", "curiosityLoss",
+            "worldModelLoss", "barlowTwinsLoss", "rewardPredictorLoss", "klLoss", "teamItemLoss", "ltmRewardLoss", "gridLoss", "varLoss", "curiosityLoss",
             "actorLoss", "entropies", "criticLoss", "curiosityCriticLoss", "advantages", "curiosityAdvantages", "criticValues", "curiosityCriticValues"
         ]
         
@@ -122,11 +121,6 @@ class Policy:
             wm_metrics = {}
 
             # --- Environment collection overlapped with training ---
-            # The episode runs on a background thread while the 500 updates execute:
-            # emulation is CPU/process-bound, training is GPU-bound, so the shorter
-            # phase hides inside the longer one. Buffer writes (episode flushes) and
-            # prefetcher sampling are serialized by buffer.lock. The collector uses
-            # the live networks, so it acts with progressively fresher weights.
             collect_result = {}
 
             def _collect():
@@ -221,7 +215,6 @@ class Policy:
                 wm_metrics.get('kl_loss', 0),                     # klLoss
                 wm_metrics.get('teamitem_loss', 0),               # teamItemLoss
                 wm_metrics.get('ltm_reward_loss', 0),             # ltmRewardLoss (whole-game LTM)
-                wm_metrics.get('map_class_loss', 0),              # mapClassLoss (map category)
                 wm_metrics.get('grid_loss', 0),                   # gridLoss (5x5 explored-grid recon)
                 wm_metrics.get('var_loss', 0),                    # varLoss (latent value-alignment)
                 wm_metrics.get('curiosity_loss', 0),              # curiosityLoss
@@ -319,14 +312,12 @@ class Policy:
         
         observations = []
         ltm_rewards = []
-        map_ids = []
         grids = []
         team_levels = []
         item_counts = []
         for obs, info in self.envs.reset():  # all emulators reset in parallel
             observations.append(obs)
             ltm_rewards.append(np.array(info["ltm_reward"], dtype=np.float32))
-            map_ids.append(np.array([info["map_id"]], dtype=np.float32))
             grids.append(np.array(info["grid"], dtype=np.float32))
             team_levels.append(np.array(info["team_levels"], dtype=np.float32))
             item_counts.append(np.array(info["item_counts"], dtype=np.float32))
@@ -334,15 +325,14 @@ class Policy:
         while min(episodes_completed) < num_episodes:
             obs_tensor = (torch.from_numpy(np.array(observations)).float() / 255.0).to(self.device)
             ltm_reward_tensor = torch.from_numpy(np.array(ltm_rewards)).float().to(self.device)
-            map_ids_tensor = torch.from_numpy(np.array(map_ids)).to(self.device)
             grid_tensor = torch.from_numpy(np.array(grids)).float().to(self.device)
             team_tensor = torch.from_numpy(np.array(team_levels)).float().to(self.device)
             item_tensor = torch.from_numpy(np.array(item_counts)).float().to(self.device)
 
             with torch.no_grad():
-                enc_img, enc_teamitem, enc_ltm_reward, enc_map_class, enc_grid = self.dreamer._encode_components(
-                    obs_tensor, ltm_reward_tensor, map_ids_tensor, grid_tensor, team_tensor, item_tensor)
-                encoded_obs = torch.cat([enc_img, enc_teamitem, enc_ltm_reward, enc_map_class, enc_grid], dim=-1)
+                enc_img, enc_teamitem, enc_ltm_reward, enc_grid = self.dreamer._encode_components(
+                    obs_tensor, ltm_reward_tensor, grid_tensor, team_tensor, item_tensor)
+                encoded_obs = torch.cat([enc_img, enc_teamitem, enc_ltm_reward, enc_grid], dim=-1)
 
                 latent_state, _ = self.dreamer.posteriorNet(encoded_obs)
 
@@ -364,7 +354,6 @@ class Policy:
 
                 observations[i] = obs
                 ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
-                map_ids[i] = np.array([info["map_id"]], dtype=np.float32)
                 grids[i] = np.array(info["grid"], dtype=np.float32)
                 team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                 item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
@@ -389,7 +378,6 @@ class Policy:
                 obs, info = self.envs.reset_one(i)
                 observations[i] = obs
                 ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
-                map_ids[i] = np.array([info["map_id"]], dtype=np.float32)
                 grids[i] = np.array(info["grid"], dtype=np.float32)
                 team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                 item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
