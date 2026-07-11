@@ -16,7 +16,7 @@ class Policy:
 
         # Run-control parameters.
         self.total_num_episodes = 10000
-        self.training_per_episodes = 500
+        self.training_per_episodes = 400
         self.seed = 42
         self.checkpoint_interval = 2   # Save every N episodes
         self.dream_horizon = 15        # number of env steps imagined per dream
@@ -30,32 +30,25 @@ class Policy:
         # ==========================================================
         self.dreamer_config = dict(
         action_dim=self.action_dim,
-
-        recurrent_dim=1024,        # size of recurrent state (h) in TSSM
-        tssm_layers=8,             # 4 -> 8: depth helps long-range dynamics most
-        tssm_heads=8,              # head_dim=128 at d_model=1024 (leave as-is)
+        recurrent_dim=512,        # size of recurrent state (h) in TSSM
+        tssm_layers=6,             # 4 -> 8: depth helps long-range dynamics most
+        tssm_heads=4,              # head_dim=128 at d_model=1024 (leave as-is)
         tssm_kv_heads=2,           # 4:1 GQA
-        tssm_ffn=2816,             # ~8/3 * 1024 (correct for this width)
-        context_length=80,         
-        rows=40, cols=40,
-        number_of_sequences=64,    
-        steps_per_sequence=96,
-        dreams_per_sequence=8,
+        tssm_ffn=1365,             # ~8/3 * 1024 (correct for this width)
+        context_length=150,         
+        rows=32, cols=32,
+        number_of_sequences=32,    
+        steps_per_sequence=200,
+        dreams_per_sequence=16,
         buffer_size=1250000,
         team_dim=6, item_dim=2,
         teamitem_out=128, ltm_reward_out=512, grid_out=128,
-        mlp_dim=1024,
+        mlp_dim=756,
         curiosity_scale=0.25, # scale of curiosity reward relative to environment reward
         pmpo_alpha=0.5,
         entropy_scale=0.1,
-        critic_ema_decay=0.97,
-        bt_alpha=5e-4,             # off-diagonal (redundancy) weight, R2-Dreamer Table 2
-        decoder_train_frames=512,  # detached viz-decoder frames per update (visualization only)
-        continue_discount=0.990,
-        dream_priority_fraction=0.025,
-        dream_reward_priority_fraction=0.025,
-        reward_sample_fraction=0.025,
-        curiosity_sample_fraction=0.025,
+        critic_ema_decay=0.90,
+        continue_discount=0.997,
         dream_lead_steps=10,
         ltm_gate_threshold=0.4,
         grid_gate_threshold=0.5,
@@ -74,7 +67,7 @@ class Policy:
         
         headers =[
             "envSteps", "gradientSteps", "totalReward", "totalCuriosity",
-            "worldModelLoss", "barlowTwinsLoss", "rewardPredictorLoss", "klLoss", "teamItemLoss", "ltmRewardLoss", "gridLoss", "varLoss", "curiosityLoss",
+            "worldModelLoss", "reconstructionLoss", "rewardPredictorLoss", "klLoss", "teamItemLoss", "ltmRewardLoss", "gridLoss", "varLoss", "curiosityLoss",
             "actorLoss", "entropies", "criticLoss", "curiosityCriticLoss", "advantages", "curiosityAdvantages", "criticValues", "curiosityCriticValues"
         ]
         
@@ -118,10 +111,6 @@ class Policy:
             random_dreams_of_episode = []
             wm_metrics = {}
 
-            # Prefetch training batches on a background thread (overlaps the CPU
-            # gather with GPU training). Episode collection now runs sequentially
-            # after the training phase, so the episode is played with the freshly
-            # updated policy instead of one that is a full episode behind.
             prefetcher = BatchPrefetcher(
                 self.dreamer.buffer,
                 batch_size=self.dreamer.number_of_sequences,
@@ -138,12 +127,11 @@ class Policy:
                     compute_metrics = (step == self.training_per_episodes - 1)
 
                     # Update Networks
-                    full_states, dream_priorities, kv_context, wm_metrics = self.dreamer.TrainWorldModel(
+                    full_states, kv_context, wm_metrics = self.dreamer.TrainWorldModel(
                         sample, compute_metrics=compute_metrics)
                     # Two dreams: max combined-advantage and a random one.
                     dream_metrics, best_dream, rand_dream = self.dreamer.Dream(
-                        full_states, batch_data=sample, horizon=self.dream_horizon,
-                        dream_priorities=dream_priorities,
+                        full_states, horizon=self.dream_horizon,
                         compute_metrics=compute_metrics,
                         kv_context=kv_context,
                     )
@@ -195,7 +183,7 @@ class Policy:
                 avg_score,                                        # totalReward
                 avg_curiosity,                                    # totalCuriosity (tiered tile curiosity, summed over episode)
                 wm_metrics.get('world_model_loss', 0),            # worldModelLoss
-                wm_metrics.get('bt_loss', 0),                     # barlowTwinsLoss (R2-Dreamer repr. loss)
+                wm_metrics.get('reconstruction_loss', 0),         # reconstructionLoss (image decoder)
                 wm_metrics.get('reward_loss', 0),                 # rewardPredictorLoss
                 wm_metrics.get('kl_loss', 0),                     # klLoss
                 wm_metrics.get('teamitem_loss', 0),               # teamItemLoss

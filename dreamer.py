@@ -117,7 +117,8 @@ class EncoderImage(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Visualization decoder (trained separately on detached states)."""
+    """Image reconstruction decoder: full state -> observation. Trained jointly with
+    the world model; its reconstruction loss is the main representation signal."""
     def __init__(self, input_size, depth=32):
         super().__init__()
         self.depth = depth
@@ -373,7 +374,7 @@ class TSSMBlock(nn.Module):
 class TSSM(nn.Module):
     def __init__(self, d_model=1024, latentSize=1600, actionSize=6,
                  n_layers=4, n_heads=8, n_kv_heads=2, ffn_hidden=2816, window=192,
-                 z_rows=40, z_cols=40, z_embed_dim=32, a_embed_dim=64, embed_hidden=None):
+                 z_rows=40, z_cols=40, embed_hidden=None):
         super().__init__()
         assert z_rows * z_cols == latentSize, "z_rows * z_cols must equal latentSize"
         self.d_model = d_model
@@ -383,35 +384,26 @@ class TSSM(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.head_dim = d_model // n_heads
         self.window = window
-        self.z_rows = z_rows
-        self.z_cols = z_cols
-
-        # --- Token tokenizer for u_t = (z_t, a_t) ---
-        self.z_embed = nn.Parameter(torch.randn(z_rows, z_cols, z_embed_dim) * 0.02)
-        self.a_embed = nn.Linear(actionSize, a_embed_dim, bias=False)
+        # --- Simple MLP tokenizer for u_t = (z_t, a_t) ---
+        # Concatenate the flattened one-hot latent with the action, then project
+        # to d_model through a 2-layer MLP.
         embed_hidden = embed_hidden if embed_hidden is not None else ffn_hidden
-        self.embed_in = nn.Linear(z_rows * z_embed_dim + a_embed_dim, d_model, bias=False)
-        self.embed_prenorm = RMSNorm(d_model)
-        self.embed_gate = nn.Linear(d_model, embed_hidden, bias=False)
-        self.embed_up = nn.Linear(d_model, embed_hidden, bias=False)
-        self.embed_down = nn.Linear(embed_hidden, d_model, bias=False)
+        self.token_mlp = nn.Sequential(
+            nn.Linear(latentSize + actionSize, embed_hidden),
+            nn.SiLU(),
+            nn.Linear(embed_hidden, d_model),
+        )
         self.embed_norm = RMSNorm(d_model)
-        nn.init.zeros_(self.embed_down.weight)  # residual branch starts as identity
 
         self.blocks = nn.ModuleList(
             [TSSMBlock(d_model, n_heads, n_kv_heads, ffn_hidden) for _ in range(n_layers)])
         self.norm_out = RMSNorm(d_model)
 
     def embed(self, latent, action):
-        """Token embedding for u_t = (z_t, a_t). latent [..., Z] one-hot blocks,
-        action [..., A]; returns [..., d_model]. Factorized latent lookup + action
-        embedding, fused by a pre-norm SwiGLU MLP with a residual connection."""
-        z = latent.view(*latent.shape[:-1], self.z_rows, self.z_cols)
-        e = torch.einsum('...rc,rcd->...rd', z, self.z_embed).flatten(-2)
-        x = self.embed_in(torch.cat((e, self.a_embed(action)), -1))   # -> d_model
-        h = self.embed_prenorm(x)
-        h = self.embed_down(F.silu(self.embed_gate(h)) * self.embed_up(h))  # SwiGLU
-        x = x + h
+        """Token embedding for u_t = (z_t, a_t): concatenate the flattened one-hot
+        latent [..., Z] with the action [..., A] and project to d_model with a
+        simple MLP. Returns [..., d_model]."""
+        x = self.token_mlp(torch.cat((latent, action), -1))
         return self.embed_norm(x)
 
     def make_cache(self, batch, max_len, device, dtype=torch.float32):
@@ -539,8 +531,7 @@ class Critic(nn.Module):
 class Buffer(object):
     def __init__(self, device, capacity=800000, actionSize=6,
                  ltm_reward_dim=LTM_REWARD_DIM,
-                 item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM,
-                 reward_sample_fraction=0.10, curiosity_sample_fraction=0.10):
+                 item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
@@ -561,15 +552,8 @@ class Buffer(object):
         self.index = 0
         self.full = False
 
-        self._reward_positions = set()
-        self._curiosity_positions = set()
-        self.reward_sample_fraction = reward_sample_fraction
-        self.curiosity_sample_fraction = curiosity_sample_fraction
-
     def add(self, observation, ltm_reward, grid, item_count, team_level, action,
             sparse_reward, standard_reward, curiosity, tier_event):
-        self._reward_positions.discard(self.index)
-        self._curiosity_positions.discard(self.index)
         self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
         self.ltm_rewards[self.index] = torch.as_tensor(ltm_reward, dtype=torch.uint8)
         self.grids[self.index] = torch.as_tensor(grid, dtype=torch.uint8)
@@ -581,11 +565,6 @@ class Buffer(object):
         self.curiosities[self.index] = torch.as_tensor(curiosity, dtype=torch.float32)
         self.tier_events[self.index] = torch.as_tensor(tier_event, dtype=torch.float32)
         self.episode_ids[self.index] = self._episode_counter
-
-        if float(sparse_reward) > 0.0:
-            self._reward_positions.add(self.index)
-        if float(tier_event) > 0.0:
-            self._curiosity_positions.add(self.index)
 
         self.index = (self.index + 1) % self.capacity
         self.full = self.full or (self.index == 0)
@@ -601,68 +580,27 @@ class Buffer(object):
         also catches windows that wrap across the write head into stale data."""
         return self.episode_ids[rows[:, 0]] == self.episode_ids[rows[:, -1]]
 
-    def _sequences_covering(self, positions, num, sequenceSize, max_tries=8):
-        pos = torch.tensor(sorted(positions), dtype=torch.long)
-        seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
-
-        def draw(n):
-            pick = pos[torch.randint(0, pos.numel(), (n, 1))]
-            in_seq = torch.randint(0, sequenceSize, (n, 1))
-            if self.full:
-                starts = (pick - in_seq) % self.capacity
-            else:
-                starts = torch.clamp(pick - in_seq, 0, self.index - sequenceSize)
-            return (starts + seq_offsets) % self.capacity
-
-        rows = draw(num)
-        for _ in range(max_tries):
-            bad = ~self._same_episode(rows)
-            if not bad.any():
-                break
-            rows[bad] = draw(int(bad.sum()))
-        return rows
-
     def sample(self, batchSize, sequenceSize):
         N = self.capacity if self.full else self.index
         if N < sequenceSize:
             return None
 
-        num_all = batchSize
-        sample_indices = []
+        limit = self.capacity if self.full else (self.index - sequenceSize + 1)
+        if limit <= 0:
+            return None
+        seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
 
-        # Bias-aware injection: force a fraction of the batch to cover reward / tier-event slots.
-        if self._reward_positions and self.reward_sample_fraction > 0.0:
-            num_reward = min(int(round(batchSize * self.reward_sample_fraction)), num_all)
-            if num_reward > 0:
-                num_all -= num_reward
-                sample_indices.append(
-                    self._sequences_covering(self._reward_positions, num_reward, sequenceSize))
+        def draw_uniform(n):
+            return (torch.randint(0, limit, (n, 1)) + seq_offsets) % self.capacity
 
-        if self._curiosity_positions and self.curiosity_sample_fraction > 0.0:
-            num_curiosity = min(int(round(batchSize * self.curiosity_sample_fraction)), num_all)
-            if num_curiosity > 0:
-                num_all -= num_curiosity
-                sample_indices.append(
-                    self._sequences_covering(self._curiosity_positions, num_curiosity, sequenceSize))
+        rows = draw_uniform(batchSize)
+        for _ in range(8):  # redraw windows that cross an episode boundary
+            bad = ~self._same_episode(rows)
+            if not bad.any():
+                break
+            rows[bad] = draw_uniform(int(bad.sum()))
 
-        if num_all > 0:
-            limit = self.capacity if self.full else (self.index - sequenceSize + 1)
-            if limit <= 0:
-                return None
-            seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
-
-            def draw_uniform(n):
-                return (torch.randint(0, limit, (n, 1)) + seq_offsets) % self.capacity
-
-            rows = draw_uniform(num_all)
-            for _ in range(8):  # redraw windows that cross an episode boundary
-                bad = ~self._same_episode(rows)
-                if not bad.any():
-                    break
-                rows[bad] = draw_uniform(int(bad.sum()))
-            sample_indices.append(rows)
-
-        sampleIndex = torch.cat(sample_indices, dim=0).long()
+        sampleIndex = rows.long()
         batch = {
             "observations":       self.observations[sampleIndex],   # uint8
             "ltm_rewards":        self.ltm_rewards[sampleIndex],     # uint8
@@ -709,13 +647,7 @@ class Buffer(object):
         self.full = (n == self.capacity)
         # Resume episode numbering above anything restored.
         self._episode_counter = int(self.episode_ids[:n].max().item()) + 1 if n > 0 else 0
-        reward_slots = (self.sparse_rewards[:n].squeeze(-1) > 0.0).nonzero(as_tuple=False).flatten()
-        self._reward_positions = set(reward_slots.tolist())
-        curiosity_slots = (self.tier_events[:n].squeeze(-1) > 0.0).nonzero(as_tuple=False).flatten()
-        self._curiosity_positions = set(curiosity_slots.tolist())
-        print(f"[*] Loaded buffer with {n} transitions (full={self.full}, write_head={self.index}, "
-              f"reward_positions={len(self._reward_positions)}, "
-              f"curiosity_positions={len(self._curiosity_positions)})")
+        print(f"[*] Loaded buffer with {n} transitions (full={self.full}, write_head={self.index})")
 
     def print_diagnostics(self):
         valid = self.capacity if self.full else self.index
@@ -782,17 +714,13 @@ class Dreamer:
                  number_of_sequences=32, steps_per_sequence=256, dreams_per_sequence=1,
                  buffer_size=1500000,
                  team_dim=6, item_dim=2, curiosity_scale=0.25, mlp_dim=1024,
-                 reward_sample_fraction=0.05, curiosity_sample_fraction=0.05,
                  entropy_scale=0.0015,
                  teamitem_out=128, ltm_reward_out=512, grid_out=128,
-                 dream_priority_fraction=0.05, dream_reward_priority_fraction=0.05,
                  dream_lead_steps=10, ltm_gate_threshold=0.4, grid_gate_threshold=0.5,
                  grid_zero_weight=5.0,
                  critic_ema_decay=0.98,
                  var_beta_dyn=0.5, var_beta_reg=0.1, var_warmup_steps=20000,
                  loss_norm_decay=0.99, reward_loss_weight=1.0,
-                 bt_loss_weight=1.0, bt_alpha=5e-4,  # Barlow Twins (R2-Dreamer) repr. loss
-                 decoder_train_frames=512,  # detached viz-decoder frames per update
                  continue_discount=0.998, pmpo_alpha=0.5):
 
         # --- Dimensions / config ---
@@ -824,8 +752,6 @@ class Dreamer:
         self.steps_per_sequence = steps_per_sequence
         self.dreams_per_sequence = dreams_per_sequence  # dream starts sampled per replay sequence
         self.buffer_capacity = buffer_size
-        self.reward_sample_fraction = reward_sample_fraction
-        self.curiosity_sample_fraction = curiosity_sample_fraction
         self.curiosity_scale = curiosity_scale
         self.envs = envs
 
@@ -836,17 +762,11 @@ class Dreamer:
         self.ltm_reward_pos_weight = torch.tensor(200.0, device=self.device)
         self.ltm_sparsity_weight = 0.5
 
-        # Exploration: fraction of dream starts resampled from high-novelty states.
-        self.dream_priority_fraction = dream_priority_fraction
-        self.dream_reward_priority_fraction = dream_reward_priority_fraction
         self.dream_lead_steps = dream_lead_steps
 
         # Dream sparse-reward curiosity gating
         self.ltm_gate_threshold = ltm_gate_threshold
-        # Dream tile-curiosity gating
         self.grid_gate_threshold = grid_gate_threshold
-        # Extra BCE weight on unexplored (target=0) grid cells: free tiles are rare
-        # in the buffer, so unweighted BCE lets the predictor default to "explored".
         self.grid_zero_weight = grid_zero_weight
 
         # --- Encodings ---
@@ -872,14 +792,8 @@ class Dreamer:
         self.ltm_reward_predictor = LongTermMemoryPredictor(self.concatenated_dim, LTM_REWARD_DIM, hidden=self.mlp_dim).to(self.device)
         self.grid_predictor = GridPredictor(self.concatenated_dim, GRID_DIM, hidden=self.mlp_dim).to(self.device)
 
-        # --- Barlow Twins projector (R2-Dreamer): latent state -> image-embedding space ---
-        self.bt_projector = nn.Linear(self.concatenated_dim, self.image_out, bias=False).to(self.device)
-        self.bt_loss_weight = bt_loss_weight
-        self.bt_alpha = bt_alpha
-
-        # --- Visualization decoder (detached; NOT part of the world-model objective) ---
+        # --- Image reconstruction decoder (part of the world-model objective) ---
         self.decoder = Decoder(input_size=self.concatenated_dim).to(self.device)
-        self.decoder_train_frames = decoder_train_frames
 
         # --- Actor / Critics ---
         self.actor = Actor(self.action_dim, self.device, self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
@@ -908,8 +822,6 @@ class Dreamer:
             ltm_reward_dim=LTM_REWARD_DIM,
             item_dim=self.item_dim, team_level_dim=self.team_dim,
             num_envs=len(envs), grid_dim=GRID_DIM,
-            reward_sample_fraction=self.reward_sample_fraction,
-            curiosity_sample_fraction=self.curiosity_sample_fraction,
         )
 
         # --- World-model parameter group ---
@@ -926,7 +838,7 @@ class Dreamer:
             + list(self.teamitemPredictor.parameters())
             + list(self.ltm_reward_predictor.parameters())
             + list(self.grid_predictor.parameters())
-            + list(self.bt_projector.parameters())
+            + list(self.decoder.parameters())
         )
 
         # --- Optimizers ---
@@ -936,8 +848,6 @@ class Dreamer:
         self.curiosityCriticOptimizer = torch.optim.Adam(self.curiosity_critic.parameters(), lr=1e-4)
         self.curiosityHeadOptimizer = torch.optim.Adam(
             self.curiosityPredictor.parameters(), lr=1e-4)
-        # Visualization decoder trains on detached states, outside the world model.
-        self.decoderOptimizer = torch.optim.Adam(self.decoder.parameters(), lr=2e-4)
 
     # ------------------------------------------------------
     def sample_batch(self, batchSize, sequenceSize):
@@ -968,22 +878,6 @@ class Dreamer:
         pos_logprob = (log_probabilities * pos).sum() / pos.sum().clamp(min=1.0)
         neg_logprob = (log_probabilities * neg).sum() / neg.sum().clamp(min=1.0)
         return -self.pmpo_alpha * pos_logprob + (1.0 - self.pmpo_alpha) * neg_logprob
-
-    def _barlow_twins_loss(self, states, image_embed):
-        """R2-Dreamer redundancy-reduction objective (Barlow Twins, Zbontar et al. 2021).
-        Aligns the projected latent state k_t = P(s_t) with the (detached) image
-        embedding e_t via their cross-correlation matrix over the B*T batch:
-        L = sum_i (1 - C_ii)^2 + alpha * sum_{i != j} C_ij^2. Replaces pixel
-        reconstruction as the representation-learning signal (no decoder gradient)."""
-        k = self.bt_projector(states).reshape(-1, self.image_out)
-        e = image_embed.detach().reshape(-1, self.image_out)  # stop-gradient target
-        k = (k - k.mean(dim=0)) / (k.std(dim=0) + 1e-5)       # standardize over batch
-        e = (e - e.mean(dim=0)) / (e.std(dim=0) + 1e-5)
-        C = (k.T @ e) / k.shape[0]                            # [D, D]
-        diag = torch.diagonal(C)
-        invariance = ((diag - 1.0) ** 2).sum()
-        redundancy = C.pow(2).sum() - diag.pow(2).sum()       # off-diagonal terms
-        return invariance + self.bt_alpha * redundancy
 
     def _ltm_loss(self, pred_logits, target, pos_weight):
         """Weighted BCE + sparsity penalty for sparse whole-game multi-label targets."""
@@ -1096,39 +990,29 @@ class Dreamer:
             beta_var = torch.zeros((), device=self.device)
             var_term = torch.zeros((), device=self.device)
 
-        # --- Barlow Twins representation loss (R2-Dreamer; replaces reconstruction) ---
-        enc_img_target = enc_img.view(B, T, self.image_out)[:, 1:]
-        bt_loss = self._barlow_twins_loss(full_states, enc_img_target)
+        # --- Image reconstruction loss (main world-model signal) ---
+        target_imgs = batch_data["observations"][:, 1:].flatten(0, 1)
+        recon_imgs = self.decoder(full_states.reshape(-1, self.concatenated_dim))
+        recon_loss = 0.5 * ((recon_imgs - target_imgs) ** 2).flatten(1).sum(-1).mean()
 
         reward_loss = reward_loss*100
         teamitem_loss = teamitem_loss*100
         ltm_reward_loss = ltm_reward_loss*100
         grid_loss = grid_loss*100
         var_term = var_term*1000
+        kl_loss = kl_loss*10
         # World Model Loss
         world_model_loss = (kl_loss + var_term
                             + reward_loss
                             + teamitem_loss
                             + ltm_reward_loss
                             + grid_loss
-                            + bt_loss)
+                            + recon_loss)
 
         # Backward pass, gradient clipping, and optimization step.
         world_model_loss.backward()
         nn.utils.clip_grad_norm_(self.worldModelParameters, 10.0, norm_type=2)
         self.worldModelOptimizer.step()
-
-        # --- Visualization decoder (detached states, own optimizer) ---
-        # Trains on every frame in the batch like the rest of the world model
-        # (states are still detached, so no gradient reaches the world model).
-        target_imgs = batch_data["observations"][:, 1:].flatten(0, 1)
-        states_flat = full_states.detach().view(-1, self.concatenated_dim)
-        self.decoderOptimizer.zero_grad(set_to_none=True)
-        recon_imgs = self.decoder(states_flat)
-        decoder_loss = F.mse_loss(recon_imgs, target_imgs)
-        decoder_loss.backward()
-        nn.utils.clip_grad_norm_(self.decoder.parameters(), 10.0, norm_type=2)
-        self.decoderOptimizer.step()
 
         # --- Curiosity head training on real states ---
         prior_states_flat = full_states_prior.detach().view(-1, self.concatenated_dim)
@@ -1146,9 +1030,6 @@ class Dreamer:
         else:
             print(f"[NaN guard] Skipped curiosity head step (grad norm: {curiosity_grad_norm.item()})")
 
-        # Dream-start priorities: sparse exploration tier-bit activations.
-        dream_priorities = batch_data["tier_events"][:, :-1].reshape(-1).detach()
-
         metrics = {}
         if compute_metrics:
             metrics = {
@@ -1163,10 +1044,9 @@ class Dreamer:
                 "ltm_reward_loss": ltm_reward_loss.item(),
                 "grid_loss": grid_loss.item(),
                 "curiosity_loss": curiosity_loss.item(),
-                "bt_loss": bt_loss.item(),
-                "decoder_loss": decoder_loss.item(),
+                "reconstruction_loss": recon_loss.item(),
             }
-        return full_states.view(-1, self.concatenated_dim).detach(), dream_priorities, kv_context, metrics
+        return full_states.view(-1, self.concatenated_dim).detach(), kv_context, metrics
 
     # -----------------------------------------------------
     @staticmethod
@@ -1178,7 +1058,7 @@ class Dreamer:
         newly_on = on & (prev_on < 0.5)                                # on now, never on before
         return newly_on.any(dim=-1).float()                            # [N, T]
 
-    def Dream(self, full_state, batch_data=None, horizon=15, dream_priorities=None,
+    def Dream(self, full_state, horizon=15,
               compute_metrics=True, kv_context=None):
         self.actorOptimizer.zero_grad(set_to_none=True)
         self.criticOptimizer.zero_grad(set_to_none=True)
@@ -1189,7 +1069,6 @@ class Dreamer:
 
         Tr = self.steps_per_sequence - 1
         layout_ok = (N == self.number_of_sequences * Tr)
-        lead = self.dream_lead_steps
 
         # --- K dream starts per sequence (K = self.dreams_per_sequence)
         K = self.dreams_per_sequence
@@ -1202,35 +1081,7 @@ class Dreamer:
             num_dreams = min(self.number_of_sequences * K, N)
             base_idx = torch.randint(0, N, (num_dreams,), device=all_states.device)
 
-        def _rewind(idx):
-            if not layout_ok or lead <= 0:
-                return idx
-            b = idx // Tr
-            t = idx % Tr
-            return b * Tr + torch.clamp(t - lead, min=0)
-
-        # --- Prioritized dream starts (sparse-reward / tier-event) ---
-        prioritized_idx = []
-        if dream_priorities is not None:
-            cur_pri = dream_priorities.detach().flatten().to(all_states.device)
-            num_cur = int(num_dreams * self.dream_priority_fraction)
-            if num_cur > 0 and torch.count_nonzero(cur_pri) > 0:
-                prioritized_idx.append(_rewind(
-                    torch.multinomial(cur_pri + 1e-8, num_cur, replacement=True)))
-
-        if batch_data is not None and "sparse_rewards" in batch_data:
-            rew_pri = batch_data["sparse_rewards"][:, :-1].reshape(-1).detach().to(all_states.device)
-            rew_pri = rew_pri.clamp(min=0.0)  # multinomial weights must be non-negative
-            num_rew = int(num_dreams * self.dream_reward_priority_fraction)
-            if num_rew > 0 and torch.count_nonzero(rew_pri) > 0:
-                prioritized_idx.append(_rewind(
-                    torch.multinomial(rew_pri + 1e-8, num_rew, replacement=True)))
-
-        if prioritized_idx:
-            pri_idx = torch.cat(prioritized_idx)[:num_dreams]
-            sel_idx = torch.cat([base_idx[:num_dreams - pri_idx.shape[0]], pri_idx])
-        else:
-            sel_idx = base_idx
+        sel_idx = base_idx
         start_states = all_states[sel_idx]
 
 
@@ -1516,11 +1367,11 @@ class Dreamer:
         'image_encoder', 'teamitem_encoder', 'ltm_reward_encoder', 'grid_encoder',
         'teamitemPredictor', 'ltm_reward_predictor', 'grid_predictor',
         'actor', 'critic', 'ema_critic', 'curiosity_critic',
-        'decoder', 'bt_projector',
+        'decoder',
     ]
     _CHECKPOINT_OPTIMIZERS = [
         'worldModelOptimizer', 'actorOptimizer', 'criticOptimizer',
-        'curiosityCriticOptimizer', 'curiosityHeadOptimizer', 'decoderOptimizer',
+        'curiosityCriticOptimizer', 'curiosityHeadOptimizer',
     ]
 
     def saveCheckpoints(self, path):
