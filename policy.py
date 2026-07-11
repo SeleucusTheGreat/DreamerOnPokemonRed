@@ -16,14 +16,14 @@ class Policy:
 
         # Run-control parameters.
         self.total_num_episodes = 10000
-        self.training_per_episodes = 400
+        self.training_per_episodes = 500
         self.seed = 42
         self.checkpoint_interval = 2   # Save every N episodes
-        self.dream_horizon = 15        # number of env steps imagined per dream
+        self.dream_horizon = 20        # number of env steps imagined per dream
 
         # How many dreams to visualize at the end of each training session.
-        self.num_max_dreams = 10       # top combined-advantage ("max") dreams to save
-        self.num_random_dreams = 10    # randomly sampled dreams to save
+        self.num_max_dreams = 15       # top combined-advantage ("max") dreams to save
+        self.num_random_dreams = 15    # randomly sampled dreams to save
 
         # ==========================================================
         # DREAMER CONFIGURATION (every Dreamer.__init__ variable, in one place)
@@ -35,24 +35,27 @@ class Policy:
         tssm_heads=4,              # head_dim=128 at d_model=1024 (leave as-is)
         tssm_kv_heads=2,           # 4:1 GQA
         tssm_ffn=1365,             # ~8/3 * 1024 (correct for this width)
-        context_length=150,         
+        context_length=180,         
         rows=32, cols=32,
         number_of_sequences=32,    
-        steps_per_sequence=200,
+        steps_per_sequence=180,
         dreams_per_sequence=16,
-        buffer_size=1250000,
+        buffer_size=1000000,
         team_dim=6, item_dim=2,
         teamitem_out=128, ltm_reward_out=512, grid_out=128,
         mlp_dim=756,
-        curiosity_scale=0.25, # scale of curiosity reward relative to environment reward
+        curiosity_scale=0.3, # scale of curiosity reward relative to environment reward
         pmpo_alpha=0.5,
         entropy_scale=0.1,
         critic_ema_decay=0.90,
         continue_discount=0.997,
         dream_lead_steps=10,
-        ltm_gate_threshold=0.4,
-        grid_gate_threshold=0.5,
-        grid_zero_weight=5.0,  # extra BCE cost for missing an unexplored grid cell
+        ltm_gate_threshold=0.3,
+        grid_gate_threshold=0.1,
+        grid_zero_weight=5.0,     # extra BCE cost for missing an unexplored grid cell
+        hero_episodes=5,          # how many top episodes the hero buffer keeps
+        hero_sample_prob=0.5,     # per-sequence chance a training sequence is drawn from a hero episode
+        hero_reward_decay=0.999,  # hero scores decay by this factor once per completed episode
     )
 
         self.visualize_dreams = visualize_dreams

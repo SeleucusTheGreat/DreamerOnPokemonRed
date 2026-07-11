@@ -531,10 +531,13 @@ class Critic(nn.Module):
 class Buffer(object):
     def __init__(self, device, capacity=800000, actionSize=6,
                  ltm_reward_dim=LTM_REWARD_DIM,
-                 item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM):
+                 item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM,
+                 hero=None, hero_sample_prob=0.1):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
+        self.hero = hero                          # optional HeroBuffer
+        self.hero_sample_prob = hero_sample_prob  # per-sequence chance to draw from it
         self._pin = torch.cuda.is_available()
         self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
         self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
@@ -614,6 +617,17 @@ class Buffer(object):
             "tier_events":        self.tier_events[sampleIndex],
             "index":              sampleIndex,
         }
+
+        # Replace a small random subset of sequences with windows from hero episodes.
+        if self.hero is not None and len(self.hero) > 0 and self.hero_sample_prob > 0.0:
+            hero_rows = (torch.rand(batchSize) < self.hero_sample_prob).nonzero(as_tuple=True)[0]
+            if hero_rows.numel() > 0:
+                hero_windows = self.hero.sample_windows(int(hero_rows.numel()), sequenceSize)
+                if hero_windows is not None:
+                    for k, v in hero_windows.items():
+                        batch[k][hero_rows] = v
+                    batch["index"][hero_rows] = -1  # mark rows not backed by the ring buffer
+
         if self._pin:
             batch = {k: v.pin_memory() for k, v in batch.items()}
         return batch
@@ -656,7 +670,100 @@ class Buffer(object):
         print("=" * 50)
         print(f"  Buffer Fill : {valid:,} / {self.capacity:,} ({100.0 * valid / self.capacity:.2f}%)")
         print(f"  Active Environments : {self.num_envs}")
+        if self.hero is not None:
+            print(f"  Hero Episodes : {len(self.hero)} / {self.hero.max_episodes} "
+                  f"(p={self.hero_sample_prob}) | scores: "
+                  f"{[round(s, 2) for s in sorted(self.hero.scores, reverse=True)]}")
         print("=" * 50 + "\n")
+
+
+# ==========================================================
+# HERO BUFFER (top-k episodes by reward)
+# ==========================================================
+class HeroBuffer(object):
+    """Keeps full copies of the best-scoring episodes. A new episode enters only if
+    its reward beats the current lowest (decayed) score; the lowest-scoring episode
+    is rotated out first. Scores decay slowly (once per completed episode) so stale
+    champions can eventually be replaced by slightly weaker fresh episodes."""
+
+    _FIELDS = ('observations', 'ltm_rewards', 'grids', 'item_counts', 'team_levels',
+               'actions', 'sparse_rewards', 'standard_rewards', 'curiosities', 'tier_events')
+    _DTYPES = (torch.uint8, torch.uint8, torch.uint8, torch.float32, torch.float32,
+               torch.float32, torch.float32, torch.float32, torch.float32, torch.float32)
+
+    def __init__(self, max_episodes=5, decay=0.999, min_length=1):
+        self.max_episodes = max_episodes
+        self.decay = decay
+        self.min_length = min_length  # episodes shorter than a training sequence are unusable
+        self.episodes = []            # list of dicts of stacked CPU tensors [T, ...]
+        self.scores = []              # decayed scores (eviction/entry threshold)
+        self.original_scores = []     # scores at insertion time (for logging)
+
+    def __len__(self):
+        return len(self.episodes)
+
+    @property
+    def min_score(self):
+        return min(self.scores) if self.scores else float('-inf')
+
+    def qualifies(self, reward, length):
+        if length < self.min_length:
+            return False
+        return len(self.episodes) < self.max_episodes or reward > self.min_score
+
+    def add_episode(self, transitions, reward):
+        """transitions: list of tuples in Buffer.add argument order. Returns True if stored."""
+        if not self.qualifies(reward, len(transitions)):
+            return False
+        cols = list(zip(*transitions))
+        episode = {}
+        for k, dtype, col in zip(self._FIELDS, self._DTYPES, cols):
+            t = torch.as_tensor(np.array(col)).to(dtype)
+            if t.dim() == 1:  # scalar fields -> [T, 1] to match the replay buffer
+                t = t.reshape(-1, 1)
+            episode[k] = t
+        if len(self.episodes) >= self.max_episodes:
+            evict = int(np.argmin(self.scores))
+            print(f"    [HERO] Evicting episode (score {self.scores[evict]:.2f}, "
+                  f"was {self.original_scores[evict]:.2f}) for new reward {reward:.2f}")
+            del self.episodes[evict], self.scores[evict], self.original_scores[evict]
+        self.episodes.append(episode)
+        self.scores.append(float(reward))
+        self.original_scores.append(float(reward))
+        print(f"    [HERO] Stored episode (reward {reward:.2f}) | "
+              f"scores: {[round(s, 2) for s in sorted(self.scores, reverse=True)]}")
+        return True
+
+    def decay_scores(self):
+        self.scores = [s * self.decay for s in self.scores]
+
+    def sample_windows(self, n, sequenceSize):
+        """Returns a dict of [n, sequenceSize, ...] CPU tensors, or None if empty/too short.
+        Episode picked uniformly among those long enough, window start uniform within it."""
+        valid = [i for i, ep in enumerate(self.episodes)
+                 if ep['observations'].shape[0] >= sequenceSize]
+        if not valid or n <= 0:
+            return None
+        picks = np.random.choice(valid, size=n)
+        out = {k: [] for k in self._FIELDS}
+        for i in picks:
+            ep = self.episodes[i]
+            start = np.random.randint(0, ep['observations'].shape[0] - sequenceSize + 1)
+            for k in self._FIELDS:
+                out[k].append(ep[k][start:start + sequenceSize])
+        return {k: torch.stack(v) for k, v in out.items()}
+
+    def save(self, path):
+        torch.save({'episodes': self.episodes, 'scores': self.scores,
+                    'original_scores': self.original_scores}, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location='cpu')
+        self.episodes = ckpt['episodes'][:self.max_episodes]
+        self.scores = ckpt['scores'][:self.max_episodes]
+        self.original_scores = ckpt.get('original_scores', list(self.scores))[:self.max_episodes]
+        print(f"[*] Loaded hero buffer with {len(self.episodes)} episodes | "
+              f"scores: {[round(s, 2) for s in sorted(self.scores, reverse=True)]}")
 
 
 # ==========================================================
@@ -721,7 +828,8 @@ class Dreamer:
                  critic_ema_decay=0.98,
                  var_beta_dyn=0.5, var_beta_reg=0.1, var_warmup_steps=20000,
                  loss_norm_decay=0.99, reward_loss_weight=1.0,
-                 continue_discount=0.998, pmpo_alpha=0.5):
+                 continue_discount=0.998, pmpo_alpha=0.5,
+                 hero_episodes=5, hero_sample_prob=0.1, hero_reward_decay=0.999):
 
         # --- Dimensions / config ---
         self.device = device
@@ -761,6 +869,10 @@ class Dreamer:
         # Whole-game LTM loss shaping (sparse multi-label targets).
         self.ltm_reward_pos_weight = torch.tensor(200.0, device=self.device)
         self.ltm_sparsity_weight = 0.5
+
+        # Curiosity targets are sparse (mostly zero): up-weight samples with real
+        # (non-zero) curiosity so the head is punished more for missing them.
+        self.curiosity_pos_weight = 5.0
 
         self.dream_lead_steps = dream_lead_steps
 
@@ -817,11 +929,16 @@ class Dreamer:
         self.continue_discount = continue_discount
 
         # --- Buffer ---
+        # Hero buffer: top-k episodes by (slowly decaying) reward, mixed into sampling.
+        # min_length ensures every stored episode can supply a full training sequence.
+        self.hero_buffer = HeroBuffer(max_episodes=hero_episodes, decay=hero_reward_decay,
+                                      min_length=steps_per_sequence)
         self.buffer = Buffer(
             device=self.device, capacity=self.buffer_capacity, actionSize=self.action_dim,
             ltm_reward_dim=LTM_REWARD_DIM,
             item_dim=self.item_dim, team_level_dim=self.team_dim,
             num_envs=len(envs), grid_dim=GRID_DIM,
+            hero=self.hero_buffer, hero_sample_prob=hero_sample_prob,
         )
 
         # --- World-model parameter group ---
@@ -1016,12 +1133,17 @@ class Dreamer:
 
         # --- Curiosity head training on real states ---
         prior_states_flat = full_states_prior.detach().view(-1, self.concatenated_dim)
+        curiosity_target_scalar = batch_data["curiosities"][:, :-1].squeeze(-1).reshape(-1)
         with torch.no_grad():
-            target_curiosity = self.two_hot.encode(batch_data["curiosities"][:, :-1].squeeze(-1).reshape(-1))
+            target_curiosity = self.two_hot.encode(curiosity_target_scalar)
         self.curiosityHeadOptimizer.zero_grad(set_to_none=True)
         pred_curiosity_logits = self.curiosityPredictor(prior_states_flat)
-        curiosity_loss = -torch.mean(torch.sum(
-            target_curiosity * torch.log_softmax(pred_curiosity_logits, dim=-1), dim=-1))
+        per_sample_ce = -torch.sum(
+            target_curiosity * torch.log_softmax(pred_curiosity_logits, dim=-1), dim=-1)
+        # Up-weight non-zero-curiosity samples: punish the head more for missing them.
+        curiosity_weights = torch.ones_like(curiosity_target_scalar)
+        curiosity_weights[curiosity_target_scalar > 0.0] = self.curiosity_pos_weight
+        curiosity_loss = (per_sample_ce * curiosity_weights).sum() / curiosity_weights.sum()
         curiosity_loss.backward()
         curiosity_grad_norm = nn.utils.clip_grad_norm_(
             self.curiosityPredictor.parameters(), 10, norm_type=2)
@@ -1124,12 +1246,12 @@ class Dreamer:
 
             # --- Anti-duplication gate  --
             reward_ltm_logits = self.ltm_reward_predictor(imagined_steps)  # [N, T, D]
-            predicted_sparse = predicted_sparse  * self._newly_activated_mask(reward_ltm_logits, self.ltm_gate_threshold)
+            predicted_sparse = predicted_sparse  #* self._newly_activated_mask(reward_ltm_logits, self.ltm_gate_threshold)
             predicted_rewards = predicted_sparse + predicted_standard
             grid_logits = self.grid_predictor(imagined_steps)             # [N, T, GRID_DIM]
             center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
             tile_gate = 1.0 - center_explored_prob
-            predicted_curiosity = predicted_curiosity * tile_gate
+            predicted_curiosity = predicted_curiosity #* tile_gate
 
         # --- Critic values (two-hot) ---
         imagined_states = full_states.detach()
@@ -1321,6 +1443,10 @@ class Dreamer:
                           f"Curiosity: {current_curiosities[i]:.3f} | "
                           f"Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
                     maps_visited[i] = set()
+                    # Decay first so the entry check compares against decayed scores,
+                    # then admit the episode if it beats the (decayed) lowest score.
+                    self.hero_buffer.decay_scores()
+                    self.hero_buffer.add_episode(local_buffers[i], current_rewards[i])
                     for transition in local_buffers[i]:
                         self.buffer.add(*transition)
                     local_buffers[i].clear()
@@ -1392,6 +1518,8 @@ class Dreamer:
         buffer_path = os.path.join(directory, "replay_buffer.buffer") if directory else "replay_buffer.buffer"
         print("Saving replay buffer...")
         self.buffer.save(buffer_path)
+        hero_path = os.path.join(directory, "hero_buffer.buffer") if directory else "hero_buffer.buffer"
+        self.hero_buffer.save(hero_path)
         return 0
 
     def loadCheckpoints(self, path=None):
@@ -1431,6 +1559,9 @@ class Dreamer:
         if os.path.exists(buffer_path):
             print("Loading replay buffer...")
             self.buffer.load(buffer_path)
+        hero_path = os.path.join(directory, "hero_buffer.buffer") if directory else "hero_buffer.buffer"
+        if os.path.exists(hero_path):
+            self.hero_buffer.load(hero_path)
         return 0
 
     # ------------------------------------------------------
