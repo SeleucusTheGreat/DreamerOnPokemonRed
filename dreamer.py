@@ -4,6 +4,7 @@ import copy  # noqa: F401
 import time
 import queue
 import threading
+from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -532,12 +533,19 @@ class Buffer(object):
     def __init__(self, device, capacity=800000, actionSize=6,
                  ltm_reward_dim=LTM_REWARD_DIM,
                  item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM,
-                 hero=None, hero_sample_prob=0.1):
+                 reward_sample_prob=0.0, reward_threshold=50.0, recent_sample_prob=0.0):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
-        self.hero = hero                          # optional HeroBuffer
-        self.hero_sample_prob = hero_sample_prob  # per-sequence chance to draw from it
+        # Reward-guaranteed sampling: per-sequence chance that the drawn window is
+        # forced to contain a transition with sparse reward >= reward_threshold.
+        self.reward_sample_prob = reward_sample_prob
+        self.reward_threshold = reward_threshold
+        # Recency sampling: per-sequence chance to draw from the freshest data
+        # (the last `num_envs` completed episodes, i.e. one collection round).
+        self.recent_sample_prob = recent_sample_prob
+        self._recent_lengths = deque(maxlen=num_envs)  # lengths of the last num_envs episodes
+        self._since_episode_start = 0                  # transitions added since last end_episode()
         self._pin = torch.cuda.is_available()
         self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
         self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
@@ -571,10 +579,19 @@ class Buffer(object):
 
         self.index = (self.index + 1) % self.capacity
         self.full = self.full or (self.index == 0)
+        self._since_episode_start += 1
 
     def end_episode(self):
         """Mark an episode boundary; call after flushing one episode's transitions."""
         self._episode_counter += 1
+        if self._since_episode_start > 0:
+            self._recent_lengths.append(self._since_episode_start)
+        self._since_episode_start = 0
+
+    def _recent_span(self):
+        """Transitions covered by the last `num_envs` completed episodes (they sit
+        contiguously behind the write head, since episodes are flushed whole)."""
+        return int(sum(self._recent_lengths))
 
     def _same_episode(self, rows):
         """rows: [num, T] index matrix -> bool [num], True if the whole window lies
@@ -596,11 +613,61 @@ class Buffer(object):
         def draw_uniform(n):
             return (torch.randint(0, limit, (n, 1)) + seq_offsets) % self.capacity
 
+        # Recency sampling: the last `num_envs` episodes occupy the `span`
+        # transitions right behind the write head; draw window starts inside it.
+        span = min(self._recent_span(), N)
+        use_recent = self.recent_sample_prob > 0.0 and span >= sequenceSize
+
+        def draw_recent(n):
+            starts = torch.randint(0, span - sequenceSize + 1, (n, 1))
+            return (self.index - span + starts + seq_offsets) % self.capacity
+
+        recent_mask = (torch.rand(batchSize) < self.recent_sample_prob) if use_recent \
+            else torch.zeros(batchSize, dtype=torch.bool)
+
+        # Reward-guaranteed sampling: force some windows to contain a transition with
+        # sparse reward >= reward_threshold. The reward step is picked uniformly among
+        # all such transitions, and its position inside the window is uniform too.
+        reward_positions = None
+        if self.reward_sample_prob > 0.0:
+            reward_positions = (self.sparse_rewards[:N, 0] >= self.reward_threshold).nonzero(as_tuple=True)[0]
+            if reward_positions.numel() == 0:
+                reward_positions = None
+        reward_mask = (torch.rand(batchSize) < self.reward_sample_prob) if reward_positions is not None \
+            else torch.zeros(batchSize, dtype=torch.bool)
+        recent_mask &= ~reward_mask  # reward guarantee takes precedence over recency
+
+        def draw_reward(n):
+            r = reward_positions[torch.randint(0, reward_positions.numel(), (n,))]
+            offset = torch.randint(0, sequenceSize, (n,))  # reward lands at this slot in the window
+            if self.full:
+                starts = (r - offset) % self.capacity
+            else:
+                starts = (r - offset).clamp(min=0, max=self.index - sequenceSize)
+            return (starts.reshape(-1, 1) + seq_offsets) % self.capacity
+
         rows = draw_uniform(batchSize)
+        if use_recent and recent_mask.any():
+            rows[recent_mask] = draw_recent(int(recent_mask.sum()))
+        if reward_mask.any():
+            rows[reward_mask] = draw_reward(int(reward_mask.sum()))
         for _ in range(8):  # redraw windows that cross an episode boundary
             bad = ~self._same_episode(rows)
             if not bad.any():
                 break
+            bad_reward = bad & reward_mask
+            bad_recent = bad & recent_mask
+            bad_uniform = bad & ~recent_mask & ~reward_mask
+            if bad_reward.any():
+                rows[bad_reward] = draw_reward(int(bad_reward.sum()))
+            if bad_recent.any():
+                rows[bad_recent] = draw_recent(int(bad_recent.sum()))
+            if bad_uniform.any():
+                rows[bad_uniform] = draw_uniform(int(bad_uniform.sum()))
+        # Stragglers that still cross a boundary (e.g. reward too close to an episode
+        # edge): fall back to plain uniform windows rather than train across a reset.
+        bad = ~self._same_episode(rows)
+        if bad.any():
             rows[bad] = draw_uniform(int(bad.sum()))
 
         sampleIndex = rows.long()
@@ -617,16 +684,6 @@ class Buffer(object):
             "tier_events":        self.tier_events[sampleIndex],
             "index":              sampleIndex,
         }
-
-        # Replace a small random subset of sequences with windows from hero episodes.
-        if self.hero is not None and len(self.hero) > 0 and self.hero_sample_prob > 0.0:
-            hero_rows = (torch.rand(batchSize) < self.hero_sample_prob).nonzero(as_tuple=True)[0]
-            if hero_rows.numel() > 0:
-                hero_windows = self.hero.sample_windows(int(hero_rows.numel()), sequenceSize)
-                if hero_windows is not None:
-                    for k, v in hero_windows.items():
-                        batch[k][hero_rows] = v
-                    batch["index"][hero_rows] = -1  # mark rows not backed by the ring buffer
 
         if self._pin:
             batch = {k: v.pin_memory() for k, v in batch.items()}
@@ -661,7 +718,15 @@ class Buffer(object):
         self.full = (n == self.capacity)
         # Resume episode numbering above anything restored.
         self._episode_counter = int(self.episode_ids[:n].max().item()) + 1 if n > 0 else 0
-        print(f"[*] Loaded buffer with {n} transitions (full={self.full}, write_head={self.index})")
+        # Rebuild the recency window from the last num_envs episode ids on disk.
+        self._recent_lengths.clear()
+        self._since_episode_start = 0
+        if n > 0:
+            ids = self.episode_ids[:n]
+            for eid in torch.unique(ids)[-self.num_envs:].tolist():
+                self._recent_lengths.append(int((ids == eid).sum().item()))
+        print(f"[*] Loaded buffer with {n} transitions (full={self.full}, write_head={self.index}, "
+              f"recent_span={self._recent_span()})")
 
     def print_diagnostics(self):
         valid = self.capacity if self.full else self.index
@@ -670,100 +735,13 @@ class Buffer(object):
         print("=" * 50)
         print(f"  Buffer Fill : {valid:,} / {self.capacity:,} ({100.0 * valid / self.capacity:.2f}%)")
         print(f"  Active Environments : {self.num_envs}")
-        if self.hero is not None:
-            print(f"  Hero Episodes : {len(self.hero)} / {self.hero.max_episodes} "
-                  f"(p={self.hero_sample_prob}) | scores: "
-                  f"{[round(s, 2) for s in sorted(self.hero.scores, reverse=True)]}")
+        print(f"  Recent Sampling : p={self.recent_sample_prob} | window {self._recent_span():,} steps "
+              f"({len(self._recent_lengths)} episodes)")
+        if self.reward_sample_prob > 0.0:
+            n_rewards = int((self.sparse_rewards[:valid, 0] >= self.reward_threshold).sum().item())
+            print(f"  Reward Windows : p={self.reward_sample_prob} | "
+                  f"{n_rewards} transitions with sparse reward >= {self.reward_threshold}")
         print("=" * 50 + "\n")
-
-
-# ==========================================================
-# HERO BUFFER (top-k episodes by reward)
-# ==========================================================
-class HeroBuffer(object):
-    """Keeps full copies of the best-scoring episodes. A new episode enters only if
-    its reward beats the current lowest (decayed) score; the lowest-scoring episode
-    is rotated out first. Scores decay slowly (once per completed episode) so stale
-    champions can eventually be replaced by slightly weaker fresh episodes."""
-
-    _FIELDS = ('observations', 'ltm_rewards', 'grids', 'item_counts', 'team_levels',
-               'actions', 'sparse_rewards', 'standard_rewards', 'curiosities', 'tier_events')
-    _DTYPES = (torch.uint8, torch.uint8, torch.uint8, torch.float32, torch.float32,
-               torch.float32, torch.float32, torch.float32, torch.float32, torch.float32)
-
-    def __init__(self, max_episodes=5, decay=0.999, min_length=1):
-        self.max_episodes = max_episodes
-        self.decay = decay
-        self.min_length = min_length  # episodes shorter than a training sequence are unusable
-        self.episodes = []            # list of dicts of stacked CPU tensors [T, ...]
-        self.scores = []              # decayed scores (eviction/entry threshold)
-        self.original_scores = []     # scores at insertion time (for logging)
-
-    def __len__(self):
-        return len(self.episodes)
-
-    @property
-    def min_score(self):
-        return min(self.scores) if self.scores else float('-inf')
-
-    def qualifies(self, reward, length):
-        if length < self.min_length:
-            return False
-        return len(self.episodes) < self.max_episodes or reward > self.min_score
-
-    def add_episode(self, transitions, reward):
-        """transitions: list of tuples in Buffer.add argument order. Returns True if stored."""
-        if not self.qualifies(reward, len(transitions)):
-            return False
-        cols = list(zip(*transitions))
-        episode = {}
-        for k, dtype, col in zip(self._FIELDS, self._DTYPES, cols):
-            t = torch.as_tensor(np.array(col)).to(dtype)
-            if t.dim() == 1:  # scalar fields -> [T, 1] to match the replay buffer
-                t = t.reshape(-1, 1)
-            episode[k] = t
-        if len(self.episodes) >= self.max_episodes:
-            evict = int(np.argmin(self.scores))
-            print(f"    [HERO] Evicting episode (score {self.scores[evict]:.2f}, "
-                  f"was {self.original_scores[evict]:.2f}) for new reward {reward:.2f}")
-            del self.episodes[evict], self.scores[evict], self.original_scores[evict]
-        self.episodes.append(episode)
-        self.scores.append(float(reward))
-        self.original_scores.append(float(reward))
-        print(f"    [HERO] Stored episode (reward {reward:.2f}) | "
-              f"scores: {[round(s, 2) for s in sorted(self.scores, reverse=True)]}")
-        return True
-
-    def decay_scores(self):
-        self.scores = [s * self.decay for s in self.scores]
-
-    def sample_windows(self, n, sequenceSize):
-        """Returns a dict of [n, sequenceSize, ...] CPU tensors, or None if empty/too short.
-        Episode picked uniformly among those long enough, window start uniform within it."""
-        valid = [i for i, ep in enumerate(self.episodes)
-                 if ep['observations'].shape[0] >= sequenceSize]
-        if not valid or n <= 0:
-            return None
-        picks = np.random.choice(valid, size=n)
-        out = {k: [] for k in self._FIELDS}
-        for i in picks:
-            ep = self.episodes[i]
-            start = np.random.randint(0, ep['observations'].shape[0] - sequenceSize + 1)
-            for k in self._FIELDS:
-                out[k].append(ep[k][start:start + sequenceSize])
-        return {k: torch.stack(v) for k, v in out.items()}
-
-    def save(self, path):
-        torch.save({'episodes': self.episodes, 'scores': self.scores,
-                    'original_scores': self.original_scores}, path)
-
-    def load(self, path):
-        ckpt = torch.load(path, map_location='cpu')
-        self.episodes = ckpt['episodes'][:self.max_episodes]
-        self.scores = ckpt['scores'][:self.max_episodes]
-        self.original_scores = ckpt.get('original_scores', list(self.scores))[:self.max_episodes]
-        print(f"[*] Loaded hero buffer with {len(self.episodes)} episodes | "
-              f"scores: {[round(s, 2) for s in sorted(self.scores, reverse=True)]}")
 
 
 # ==========================================================
@@ -829,7 +807,8 @@ class Dreamer:
                  var_beta_dyn=0.5, var_beta_reg=0.1, var_warmup_steps=20000,
                  loss_norm_decay=0.99, reward_loss_weight=1.0,
                  continue_discount=0.998, pmpo_alpha=0.5,
-                 hero_episodes=5, hero_sample_prob=0.1, hero_reward_decay=0.999):
+                 reward_sample_prob=0.0, reward_threshold=50.0,
+                 recent_sample_prob=0.0):
 
         # --- Dimensions / config ---
         self.device = device
@@ -914,6 +893,9 @@ class Dreamer:
         for p in self.ema_critic.parameters():
             p.requires_grad = False
         self.curiosity_critic = Critic(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.ema_curiosity_critic = copy.deepcopy(self.curiosity_critic)
+        for p in self.ema_curiosity_critic.parameters():
+            p.requires_grad = False
         self.critic_ema_decay = critic_ema_decay
 
 
@@ -929,16 +911,13 @@ class Dreamer:
         self.continue_discount = continue_discount
 
         # --- Buffer ---
-        # Hero buffer: top-k episodes by (slowly decaying) reward, mixed into sampling.
-        # min_length ensures every stored episode can supply a full training sequence.
-        self.hero_buffer = HeroBuffer(max_episodes=hero_episodes, decay=hero_reward_decay,
-                                      min_length=steps_per_sequence)
         self.buffer = Buffer(
             device=self.device, capacity=self.buffer_capacity, actionSize=self.action_dim,
             ltm_reward_dim=LTM_REWARD_DIM,
             item_dim=self.item_dim, team_level_dim=self.team_dim,
             num_envs=len(envs), grid_dim=GRID_DIM,
-            hero=self.hero_buffer, hero_sample_prob=hero_sample_prob,
+            reward_sample_prob=reward_sample_prob, reward_threshold=reward_threshold,
+            recent_sample_prob=recent_sample_prob,
         )
 
         # --- World-model parameter group ---
@@ -1286,11 +1265,17 @@ class Dreamer:
             ema_probs * (torch.log_softmax(ema_critic_logits, dim=-1) - torch.log_softmax(critic_logits_to_train, dim=-1)), dim=-1))
         critic_loss = critic_loss_main + critic_ema_reg
 
-        # --- Curiosity critic loss (CE to lambda returns) ---
+        # --- Curiosity critic loss (CE to lambda returns + EMA KL anchor) ---
         curiosity_critic_logits_to_train = curiosity_critic_logits[:, :-1]
         target_curiosity_values_two_hot = self.two_hot.encode(curiosity_lambda_values.detach())
-        curiosity_critic_loss = -torch.mean(torch.sum(
+        curiosity_critic_loss_main = -torch.mean(torch.sum(
             target_curiosity_values_two_hot * torch.log_softmax(curiosity_critic_logits_to_train, dim=-1), dim=-1))
+        with torch.no_grad():
+            ema_curiosity_critic_logits = self.ema_curiosity_critic(imagined_states[:, :-1])
+            ema_curiosity_probs = torch.softmax(ema_curiosity_critic_logits, dim=-1)
+        curiosity_critic_ema_reg = torch.mean(torch.sum(
+            ema_curiosity_probs * (torch.log_softmax(ema_curiosity_critic_logits, dim=-1) - torch.log_softmax(curiosity_critic_logits_to_train, dim=-1)), dim=-1))
+        curiosity_critic_loss = curiosity_critic_loss_main + curiosity_critic_ema_reg
 
         # --- Optimization ---
         critic_loss.backward()
@@ -1311,6 +1296,11 @@ class Dreamer:
             src_params = list(self.critic.parameters())
             torch._foreach_mul_(ema_params, self.critic_ema_decay)
             torch._foreach_add_(ema_params, src_params, alpha=1.0 - self.critic_ema_decay)
+
+            ema_curiosity_params = list(self.ema_curiosity_critic.parameters())
+            src_curiosity_params = list(self.curiosity_critic.parameters())
+            torch._foreach_mul_(ema_curiosity_params, self.critic_ema_decay)
+            torch._foreach_add_(ema_curiosity_params, src_curiosity_params, alpha=1.0 - self.critic_ema_decay)
 
         metrics = {}
         if compute_metrics:
@@ -1443,10 +1433,6 @@ class Dreamer:
                           f"Curiosity: {current_curiosities[i]:.3f} | "
                           f"Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
                     maps_visited[i] = set()
-                    # Decay first so the entry check compares against decayed scores,
-                    # then admit the episode if it beats the (decayed) lowest score.
-                    self.hero_buffer.decay_scores()
-                    self.hero_buffer.add_episode(local_buffers[i], current_rewards[i])
                     for transition in local_buffers[i]:
                         self.buffer.add(*transition)
                     local_buffers[i].clear()
@@ -1492,7 +1478,7 @@ class Dreamer:
         'curiosityPredictor',
         'image_encoder', 'teamitem_encoder', 'ltm_reward_encoder', 'grid_encoder',
         'teamitemPredictor', 'ltm_reward_predictor', 'grid_predictor',
-        'actor', 'critic', 'ema_critic', 'curiosity_critic',
+        'actor', 'critic', 'ema_critic', 'curiosity_critic', 'ema_curiosity_critic',
         'decoder',
     ]
     _CHECKPOINT_OPTIMIZERS = [
@@ -1518,8 +1504,6 @@ class Dreamer:
         buffer_path = os.path.join(directory, "replay_buffer.buffer") if directory else "replay_buffer.buffer"
         print("Saving replay buffer...")
         self.buffer.save(buffer_path)
-        hero_path = os.path.join(directory, "hero_buffer.buffer") if directory else "hero_buffer.buffer"
-        self.hero_buffer.save(hero_path)
         return 0
 
     def loadCheckpoints(self, path=None):
@@ -1559,9 +1543,6 @@ class Dreamer:
         if os.path.exists(buffer_path):
             print("Loading replay buffer...")
             self.buffer.load(buffer_path)
-        hero_path = os.path.join(directory, "hero_buffer.buffer") if directory else "hero_buffer.buffer"
-        if os.path.exists(hero_path):
-            self.hero_buffer.load(hero_path)
         return 0
 
     # ------------------------------------------------------

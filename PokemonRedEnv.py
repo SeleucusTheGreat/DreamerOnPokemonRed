@@ -160,7 +160,7 @@ class PokemonRedEnv(gym.Env):
         self.pyboy.set_emulation_speed(speed) # 0 = Unlimited speed for training
         
         # Budget Constants
-        self.init_steps = 15000
+        self.init_steps = 12500
 
 
         # --- REWARDS CONSTANTS ---
@@ -299,10 +299,9 @@ class PokemonRedEnv(gym.Env):
     def _apply_action(self, action):
         press, release = self.buttons[action]
         self.pyboy.send_input(press)
-        self.pyboy.tick(16, False)   # emulate without rendering (screen is read once per step)
+        self.pyboy.tick(16, True)
         self.pyboy.send_input(release)
-        self.pyboy.tick(7, False)
-        self.pyboy.tick(1, True)     # render only the final frame, the one _get_obs() reads
+        self.pyboy.tick(8, True)
 
     # ==========================================================
     # GYM METHODS
@@ -663,7 +662,7 @@ class SequentialPokemonEnvs:
             e.close()
 
 
-def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null", parallel=True):
+def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null", speed=0, parallel=True):
     """Create `num_envs` environments, all loading from PokemonRed.Start.state (the only
     supported start state); parallel=True uses one process per emulator, False is a
     single-process debugging fallback with the same interface."""
@@ -680,14 +679,14 @@ def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null", para
     if parallel:
         return ParallelPokemonEnvs(
             num_envs=num_envs, rom_path=rom_path, state_path=state_path,
-            window=wind, speed=0, verbose=True,
+            window=wind, speed=speed, verbose=True,
         )
 
     # In-process fallback.
     envs = [
         PokemonRedEnv(
             rom_path=rom_path, state_path=state_path,
-            verbose=True, window=wind, speed=0,
+            verbose=True, window=wind, speed=speed,
         )
         for _ in range(num_envs)
     ]

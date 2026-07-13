@@ -16,46 +16,46 @@ class Policy:
 
         # Run-control parameters.
         self.total_num_episodes = 10000
-        self.training_per_episodes = 500
+        self.training_per_episodes = 350
         self.seed = 42
         self.checkpoint_interval = 2   # Save every N episodes
         self.dream_horizon = 20        # number of env steps imagined per dream
 
         # How many dreams to visualize at the end of each training session.
-        self.num_max_dreams = 15       # top combined-advantage ("max") dreams to save
-        self.num_random_dreams = 15    # randomly sampled dreams to save
+        self.num_max_dreams = 5       # top combined-advantage ("max") dreams to save
+        self.num_random_dreams = 5    # randomly sampled dreams to save
 
         # ==========================================================
         # DREAMER CONFIGURATION (every Dreamer.__init__ variable, in one place)
         # ==========================================================
         self.dreamer_config = dict(
         action_dim=self.action_dim,
-        recurrent_dim=512,        # size of recurrent state (h) in TSSM
-        tssm_layers=6,             # 4 -> 8: depth helps long-range dynamics most
+        recurrent_dim=1024,        # size of recurrent state (h) in TSSM
+        tssm_layers=8,             # 4 -> 8: depth helps long-range dynamics most
         tssm_heads=4,              # head_dim=128 at d_model=1024 (leave as-is)
         tssm_kv_heads=2,           # 4:1 GQA
-        tssm_ffn=1365,             # ~8/3 * 1024 (correct for this width)
-        context_length=180,         
-        rows=32, cols=32,
-        number_of_sequences=32,    
-        steps_per_sequence=180,
+        tssm_ffn=2730,             # ~8/3 * 1024 (correct for this width)
+        context_length=60,         
+        rows=40, cols=40,
+        number_of_sequences=80,    
+        steps_per_sequence=60,
         dreams_per_sequence=16,
         buffer_size=1000000,
         team_dim=6, item_dim=2,
-        teamitem_out=128, ltm_reward_out=512, grid_out=128,
-        mlp_dim=756,
-        curiosity_scale=0.3, # scale of curiosity reward relative to environment reward
+        teamitem_out=128, ltm_reward_out=512, grid_out=256,
+        mlp_dim=1024,
+        curiosity_scale=0.5, # scale of curiosity reward relative to environment reward
         pmpo_alpha=0.5,
-        entropy_scale=0.1,
+        entropy_scale=0.05,
         critic_ema_decay=0.90,
         continue_discount=0.997,
         dream_lead_steps=10,
         ltm_gate_threshold=0.3,
         grid_gate_threshold=0.1,
         grid_zero_weight=5.0,     # extra BCE cost for missing an unexplored grid cell
-        hero_episodes=5,          # how many top episodes the hero buffer keeps
-        hero_sample_prob=0.5,     # per-sequence chance a training sequence is drawn from a hero episode
-        hero_reward_decay=0.999,  # hero scores decay by this factor once per completed episode
+        reward_sample_prob=0.2,   # per-sequence chance the sampled window is forced to contain a big sparse reward
+        reward_threshold=50.0,    # "big reward" cutoff for the guarantee above
+        recent_sample_prob=0.03,   # per-sequence chance to sample from the freshest num_envs episodes
     )
 
         self.visualize_dreams = visualize_dreams
