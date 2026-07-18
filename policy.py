@@ -16,7 +16,7 @@ class Policy:
 
         # Run-control parameters.
         self.total_num_episodes = 10000
-        self.training_per_episodes = 350
+        self.training_per_episodes = 250
         self.seed = 42
         self.checkpoint_interval = 2   # Save every N episodes
         self.dream_horizon = 20        # number of env steps imagined per dream
@@ -30,30 +30,29 @@ class Policy:
         # ==========================================================
         self.dreamer_config = dict(
         action_dim=self.action_dim,
-        recurrent_dim=1024,        # size of recurrent state (h) in TSSM
-        tssm_layers=8,             # 4 -> 8: depth helps long-range dynamics most
+        recurrent_dim=512,        # size of recurrent state (h) in TSSM
+        tssm_layers=6,             # 4 -> 8: depth helps long-range dynamics most
         tssm_heads=4,              # head_dim=128 at d_model=1024 (leave as-is)
-        tssm_kv_heads=2,           # 4:1 GQA
-        tssm_ffn=2730,             # ~8/3 * 1024 (correct for this width)
-        context_length=60,         
+        tssm_kv_heads=4,           # 4:1 GQA
+        tssm_ffn=1365,             # ~8/3 * 1024 (correct for this width)
+        context_length=80,         
         rows=40, cols=40,
-        number_of_sequences=80,    
-        steps_per_sequence=60,
-        dreams_per_sequence=16,
+        number_of_sequences=64,    
+        steps_per_sequence=80,
+        dreams_per_sequence=4,
         buffer_size=1000000,
         team_dim=6, item_dim=2,
-        teamitem_out=128, ltm_reward_out=512, grid_out=256,
+        teamitem_out=128, ltm_reward_out=512, grid_out=128,
         mlp_dim=1024,
-        curiosity_scale=0.5, # scale of curiosity reward relative to environment reward
+        curiosity_scale=0.3, # scale of curiosity reward relative to environment reward
         pmpo_alpha=0.5,
-        entropy_scale=0.05,
-        critic_ema_decay=0.90,
+        entropy_scale=0.1,
         continue_discount=0.997,
         dream_lead_steps=10,
         ltm_gate_threshold=0.3,
         grid_gate_threshold=0.1,
-        grid_zero_weight=5.0,     # extra BCE cost for missing an unexplored grid cell
-        reward_sample_prob=0.2,   # per-sequence chance the sampled window is forced to contain a big sparse reward
+        grid_zero_weight=20.0,     # extra BCE cost for missing an unexplored grid cell
+        reward_sample_prob=0.05,   # per-sequence chance the sampled window is forced to contain a big sparse reward
         reward_threshold=50.0,    # "big reward" cutoff for the guarantee above
         recent_sample_prob=0.03,   # per-sequence chance to sample from the freshest num_envs episodes
     )

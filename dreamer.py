@@ -803,7 +803,6 @@ class Dreamer:
                  teamitem_out=128, ltm_reward_out=512, grid_out=128,
                  dream_lead_steps=10, ltm_gate_threshold=0.4, grid_gate_threshold=0.5,
                  grid_zero_weight=5.0,
-                 critic_ema_decay=0.98,
                  var_beta_dyn=0.5, var_beta_reg=0.1, var_warmup_steps=20000,
                  loss_norm_decay=0.99, reward_loss_weight=1.0,
                  continue_discount=0.998, pmpo_alpha=0.5,
@@ -889,24 +888,13 @@ class Dreamer:
         # --- Actor / Critics ---
         self.actor = Actor(self.action_dim, self.device, self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.critic = Critic(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
-        self.ema_critic = copy.deepcopy(self.critic)
-        for p in self.ema_critic.parameters():
-            p.requires_grad = False
         self.curiosity_critic = Critic(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
-        self.ema_curiosity_critic = copy.deepcopy(self.curiosity_critic)
-        for p in self.ema_curiosity_critic.parameters():
-            p.requires_grad = False
-        self.critic_ema_decay = critic_ema_decay
 
 
         # Latent-space value-alignment regularization (Var) config.
         self.var_beta_dyn = var_beta_dyn
         self.var_beta_reg = var_beta_reg
         self.var_warmup_steps = var_warmup_steps  # gated on total_num_updates (persisted in checkpoints)
-        # DreamerV4-style loss normalization: EMA of each term's RMS (KL and Var excluded).
-        self.loss_norm_decay = loss_norm_decay
-        self._loss_rms = {}
-        # Priority boosts applied on top of the unit-scale normalization.
         self.reward_loss_weight = reward_loss_weight
         self.continue_discount = continue_discount
 
@@ -1254,28 +1242,16 @@ class Dreamer:
                       + self.curiosity_scale * self._pmpo_loss(curiosity_advantages, log_probabilities)
                       - self.entropy_scale * entropies.mean())
 
-        # --- Reward critic loss (CE to lambda returns + EMA KL anchor) ---
+        # --- Reward critic loss (CE to lambda returns) ---
         critic_logits_to_train = critic_logits[:, :-1]
         target_values_two_hot = self.two_hot.encode(lambda_values.detach())
-        critic_loss_main = -torch.mean(torch.sum(target_values_two_hot * torch.log_softmax(critic_logits_to_train, dim=-1), dim=-1))
-        with torch.no_grad():
-            ema_critic_logits = self.ema_critic(imagined_states[:, :-1])
-            ema_probs = torch.softmax(ema_critic_logits, dim=-1)
-        critic_ema_reg = torch.mean(torch.sum(
-            ema_probs * (torch.log_softmax(ema_critic_logits, dim=-1) - torch.log_softmax(critic_logits_to_train, dim=-1)), dim=-1))
-        critic_loss = critic_loss_main + critic_ema_reg
+        critic_loss = -torch.mean(torch.sum(target_values_two_hot * torch.log_softmax(critic_logits_to_train, dim=-1), dim=-1))
 
-        # --- Curiosity critic loss (CE to lambda returns + EMA KL anchor) ---
+        # --- Curiosity critic loss (CE to lambda returns) ---
         curiosity_critic_logits_to_train = curiosity_critic_logits[:, :-1]
         target_curiosity_values_two_hot = self.two_hot.encode(curiosity_lambda_values.detach())
-        curiosity_critic_loss_main = -torch.mean(torch.sum(
+        curiosity_critic_loss = -torch.mean(torch.sum(
             target_curiosity_values_two_hot * torch.log_softmax(curiosity_critic_logits_to_train, dim=-1), dim=-1))
-        with torch.no_grad():
-            ema_curiosity_critic_logits = self.ema_curiosity_critic(imagined_states[:, :-1])
-            ema_curiosity_probs = torch.softmax(ema_curiosity_critic_logits, dim=-1)
-        curiosity_critic_ema_reg = torch.mean(torch.sum(
-            ema_curiosity_probs * (torch.log_softmax(ema_curiosity_critic_logits, dim=-1) - torch.log_softmax(curiosity_critic_logits_to_train, dim=-1)), dim=-1))
-        curiosity_critic_loss = curiosity_critic_loss_main + curiosity_critic_ema_reg
 
         # --- Optimization ---
         critic_loss.backward()
@@ -1289,18 +1265,6 @@ class Dreamer:
         actor_loss.backward()
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0, norm_type=2)
         self.actorOptimizer.step()
-
-        # --- EMA reward-critic update ---
-        with torch.no_grad():
-            ema_params = list(self.ema_critic.parameters())
-            src_params = list(self.critic.parameters())
-            torch._foreach_mul_(ema_params, self.critic_ema_decay)
-            torch._foreach_add_(ema_params, src_params, alpha=1.0 - self.critic_ema_decay)
-
-            ema_curiosity_params = list(self.ema_curiosity_critic.parameters())
-            src_curiosity_params = list(self.curiosity_critic.parameters())
-            torch._foreach_mul_(ema_curiosity_params, self.critic_ema_decay)
-            torch._foreach_add_(ema_curiosity_params, src_curiosity_params, alpha=1.0 - self.critic_ema_decay)
 
         metrics = {}
         if compute_metrics:
@@ -1478,7 +1442,7 @@ class Dreamer:
         'curiosityPredictor',
         'image_encoder', 'teamitem_encoder', 'ltm_reward_encoder', 'grid_encoder',
         'teamitemPredictor', 'ltm_reward_predictor', 'grid_predictor',
-        'actor', 'critic', 'ema_critic', 'curiosity_critic', 'ema_curiosity_critic',
+        'actor', 'critic', 'curiosity_critic',
         'decoder',
     ]
     _CHECKPOINT_OPTIMIZERS = [
