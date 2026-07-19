@@ -1,12 +1,8 @@
 import os
 import glob
-import copy  # noqa: F401
-import time
-import queue
-import threading
-from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure as MplFigure
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +13,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from PokemonRedEnv import (LTM_REWARD_DIM,
                            GRID_DIM, GRID_CENTER_INDEX, MAP_NAMES)
 
-IMAGE_SIZE = 64
+IMAGE_SIZE = 96
 
 torch.set_float32_matmul_precision('high')
 
@@ -100,12 +96,12 @@ class EncoderImage(nn.Module):
     def __init__(self, output_size=1024, depth=32):
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Conv2d(3, depth, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth),                 # 64 -> 32
-            nn.Conv2d(depth, depth * 2, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth * 2),     # 32 -> 16
-            nn.Conv2d(depth * 2, depth * 4, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth * 4), # 16 -> 8
-            nn.Conv2d(depth * 4, depth * 8, kernel_size=4, stride=2, padding=1), nn.ELU(),                      # 8 -> 4
+            nn.Conv2d(3, depth, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth),                 # 96 -> 48
+            nn.Conv2d(depth, depth * 2, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth * 2),     # 48 -> 24
+            nn.Conv2d(depth * 2, depth * 4, kernel_size=4, stride=2, padding=1), nn.ELU(), ResBlock(depth * 4), # 24 -> 12
+            nn.Conv2d(depth * 4, depth * 8, kernel_size=4, stride=2, padding=1), nn.ELU(),                      # 12 -> 6
             nn.Flatten(),
-            nn.Linear(depth * 8 * 4 * 4, output_size),
+            nn.Linear(depth * 8 * 6 * 6, output_size),
             nn.LayerNorm(output_size),
         )
         # Lay the conv stack out for channels_last so cuDNN picks its fast kernels.
@@ -123,21 +119,21 @@ class Decoder(nn.Module):
     def __init__(self, input_size, depth=32):
         super().__init__()
         self.depth = depth
-        self.linear = nn.Linear(input_size, depth * 8 * 4 * 4)
+        self.linear = nn.Linear(input_size, depth * 8 * 6 * 6)
         self.net = nn.Sequential(
             ResBlock(depth * 8),
-            nn.ConvTranspose2d(depth * 8, depth * 4, 4, stride=2, padding=1), nn.ELU(),  # 4 -> 8
+            nn.ConvTranspose2d(depth * 8, depth * 4, 4, stride=2, padding=1), nn.ELU(),  # 6 -> 12
             ResBlock(depth * 4),
-            nn.ConvTranspose2d(depth * 4, depth * 2, 4, stride=2, padding=1), nn.ELU(),  # 8 -> 16
+            nn.ConvTranspose2d(depth * 4, depth * 2, 4, stride=2, padding=1), nn.ELU(),  # 12 -> 24
             ResBlock(depth * 2),
-            nn.ConvTranspose2d(depth * 2, depth, 4, stride=2, padding=1), nn.ELU(),      # 16 -> 32
-            nn.ConvTranspose2d(depth, 3, 4, stride=2, padding=1),                        # 32 -> 64
+            nn.ConvTranspose2d(depth * 2, depth, 4, stride=2, padding=1), nn.ELU(),      # 24 -> 48
+            nn.ConvTranspose2d(depth, 3, 4, stride=2, padding=1),                        # 48 -> 96
         )
         self.net = self.net.to(memory_format=torch.channels_last)
 
     def forward(self, x):
         x = self.linear(x)
-        x = x.view(-1, self.depth * 8, 4, 4)
+        x = x.view(-1, self.depth * 8, 6, 6)
         x = x.contiguous(memory_format=torch.channels_last)
         return self.net(x)
 
@@ -533,7 +529,8 @@ class Buffer(object):
     def __init__(self, device, capacity=800000, actionSize=6,
                  ltm_reward_dim=LTM_REWARD_DIM,
                  item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM,
-                 reward_sample_prob=0.0, reward_threshold=50.0, recent_sample_prob=0.0):
+                 reward_sample_prob=0.0, reward_threshold=50.0, recent_sample_prob=0.0,
+                 curiosity_sample_prob=0.0, curiosity_window_min=8):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
@@ -541,12 +538,23 @@ class Buffer(object):
         # forced to contain a transition with sparse reward >= reward_threshold.
         self.reward_sample_prob = reward_sample_prob
         self.reward_threshold = reward_threshold
+        # Curiosity-guaranteed sampling: per-sequence chance that the drawn window
+        # comes from a pre-approved list of starts whose window contains at least
+        # curiosity_window_min exploration (nonzero-curiosity) steps. The list is
+        # rebuilt lazily once per collection round (see _rebuild_curiosity_starts).
+        self.curiosity_sample_prob = curiosity_sample_prob
+        self.curiosity_window_min = curiosity_window_min
+        self._curiosity_starts = torch.empty(0, dtype=torch.long)
+        self._curiosity_dirty = True
+        self._curiosity_T = 0
         # Recency sampling: per-sequence chance to draw from the freshest data
         # (the last `num_envs` completed episodes, i.e. one collection round).
         self.recent_sample_prob = recent_sample_prob
-        self._recent_lengths = deque(maxlen=num_envs)  # lengths of the last num_envs episodes
+        # Moving average of episode length (steps); drives the recency window
+        # (avg_episode_length * num_envs) and is persisted in the buffer checkpoint.
+        self.episode_len_ema_decay = 0.9
+        self.avg_episode_length = 0.0
         self._since_episode_start = 0                  # transitions added since last end_episode()
-        self._pin = torch.cuda.is_available()
         self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
         self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
         self.grids = torch.empty((capacity, grid_dim), dtype=torch.uint8, device='cpu')
@@ -585,13 +593,38 @@ class Buffer(object):
         """Mark an episode boundary; call after flushing one episode's transitions."""
         self._episode_counter += 1
         if self._since_episode_start > 0:
-            self._recent_lengths.append(self._since_episode_start)
+            L = float(self._since_episode_start)
+            self.avg_episode_length = L if self.avg_episode_length == 0.0 else \
+                self.episode_len_ema_decay * self.avg_episode_length + (1.0 - self.episode_len_ema_decay) * L
         self._since_episode_start = 0
+        self._curiosity_dirty = True  # new data -> pre-approved starts need a rebuild
+
+    def _rebuild_curiosity_starts(self, sequenceSize):
+        """Pre-approve every window start whose sequenceSize-step window contains at
+        least curiosity_window_min nonzero-curiosity steps and lies within a single
+        episode. One vectorized pass via a cumulative sum; runs once per collection
+        round (lazily, on the first sample() after end_episode)."""
+        self._curiosity_dirty = False
+        self._curiosity_T = sequenceSize
+        N = self.capacity if self.full else self.index
+        T = sequenceSize
+        if N < T:
+            self._curiosity_starts = torch.empty(0, dtype=torch.long)
+            return
+        indicator = (self.curiosities[:N, 0] > 0).float()
+        C = torch.cumsum(indicator, dim=0)
+        # counts[s] = number of nonzero-curiosity steps in window [s, s+T)
+        counts = C[T - 1:] - torch.cat([C.new_zeros(1), C[:N - T]])
+        # Same-episode validity (ids are monotone in write order, so equal endpoints
+        # imply a uniform interior; also rejects windows crossing the write head).
+        valid = self.episode_ids[:N - T + 1] == self.episode_ids[T - 1:N]
+        self._curiosity_starts = ((counts >= self.curiosity_window_min) & valid).nonzero(as_tuple=True)[0]
 
     def _recent_span(self):
-        """Transitions covered by the last `num_envs` completed episodes (they sit
-        contiguously behind the write head, since episodes are flushed whole)."""
-        return int(sum(self._recent_lengths))
+        """Approximate transitions covered by the last collection round: the moving
+        average episode length times num_envs (recent episodes sit contiguously
+        behind the write head, since episodes are flushed whole)."""
+        return int(round(self.avg_episode_length * self.num_envs))
 
     def _same_episode(self, rows):
         """rows: [num, T] index matrix -> bool [num], True if the whole window lies
@@ -635,7 +668,20 @@ class Buffer(object):
                 reward_positions = None
         reward_mask = (torch.rand(batchSize) < self.reward_sample_prob) if reward_positions is not None \
             else torch.zeros(batchSize, dtype=torch.bool)
-        recent_mask &= ~reward_mask  # reward guarantee takes precedence over recency
+
+        # Curiosity-guaranteed sampling: force some windows to start at pre-approved
+        # positions whose window holds >= curiosity_window_min exploration steps.
+        if self.curiosity_sample_prob > 0.0 and (self._curiosity_dirty or self._curiosity_T != sequenceSize):
+            self._rebuild_curiosity_starts(sequenceSize)
+        use_curiosity = self.curiosity_sample_prob > 0.0 and self._curiosity_starts.numel() > 0
+        curiosity_mask = (torch.rand(batchSize) < self.curiosity_sample_prob) if use_curiosity \
+            else torch.zeros(batchSize, dtype=torch.bool)
+        curiosity_mask &= ~reward_mask                    # reward guarantee takes precedence
+        recent_mask &= ~reward_mask & ~curiosity_mask     # ... then curiosity, then recency
+
+        def draw_curiosity(n):
+            starts = self._curiosity_starts[torch.randint(0, self._curiosity_starts.numel(), (n,))]
+            return (starts.reshape(-1, 1) + seq_offsets) % self.capacity
 
         def draw_reward(n):
             r = reward_positions[torch.randint(0, reward_positions.numel(), (n,))]
@@ -649,15 +695,18 @@ class Buffer(object):
         rows = draw_uniform(batchSize)
         if use_recent and recent_mask.any():
             rows[recent_mask] = draw_recent(int(recent_mask.sum()))
+        if use_curiosity and curiosity_mask.any():
+            rows[curiosity_mask] = draw_curiosity(int(curiosity_mask.sum()))
         if reward_mask.any():
             rows[reward_mask] = draw_reward(int(reward_mask.sum()))
         for _ in range(8):  # redraw windows that cross an episode boundary
             bad = ~self._same_episode(rows)
             if not bad.any():
                 break
+            # (curiosity windows are pre-validated same-episode, so never land here)
             bad_reward = bad & reward_mask
             bad_recent = bad & recent_mask
-            bad_uniform = bad & ~recent_mask & ~reward_mask
+            bad_uniform = bad & ~recent_mask & ~reward_mask & ~curiosity_mask
             if bad_reward.any():
                 rows[bad_reward] = draw_reward(int(bad_reward.sum()))
             if bad_recent.any():
@@ -685,8 +734,6 @@ class Buffer(object):
             "index":              sampleIndex,
         }
 
-        if self._pin:
-            batch = {k: v.pin_memory() for k, v in batch.items()}
         return batch
 
     def save(self, path):
@@ -705,6 +752,7 @@ class Buffer(object):
             'episode_ids': self.episode_ids[:limit],
             'index': self.index,
             'full': self.full,
+            'avg_episode_length': self.avg_episode_length,
         }, path)
 
     def load(self, path):
@@ -716,15 +764,18 @@ class Buffer(object):
             getattr(self, name)[:n] = ckpt[name][:n]  # KeyError = incompatible old buffer
         self.index = n % self.capacity
         self.full = (n == self.capacity)
+        self._curiosity_dirty = True  # restored data -> pre-approved starts need a rebuild
         # Resume episode numbering above anything restored.
         self._episode_counter = int(self.episode_ids[:n].max().item()) + 1 if n > 0 else 0
-        # Rebuild the recency window from the last num_envs episode ids on disk.
-        self._recent_lengths.clear()
         self._since_episode_start = 0
-        if n > 0:
+        # Restore the episode-length moving average; for old buffer files without it,
+        # bootstrap from the mean length of the last num_envs episodes on disk.
+        self.avg_episode_length = float(ckpt.get('avg_episode_length', 0.0))
+        if self.avg_episode_length == 0.0 and n > 0:
             ids = self.episode_ids[:n]
-            for eid in torch.unique(ids)[-self.num_envs:].tolist():
-                self._recent_lengths.append(int((ids == eid).sum().item()))
+            lengths = [int((ids == eid).sum().item()) for eid in torch.unique(ids)[-self.num_envs:].tolist()]
+            if lengths:
+                self.avg_episode_length = float(sum(lengths)) / len(lengths)
         print(f"[*] Loaded buffer with {n} transitions (full={self.full}, write_head={self.index}, "
               f"recent_span={self._recent_span()})")
 
@@ -736,56 +787,17 @@ class Buffer(object):
         print(f"  Buffer Fill : {valid:,} / {self.capacity:,} ({100.0 * valid / self.capacity:.2f}%)")
         print(f"  Active Environments : {self.num_envs}")
         print(f"  Recent Sampling : p={self.recent_sample_prob} | window {self._recent_span():,} steps "
-              f"({len(self._recent_lengths)} episodes)")
+              f"(avg episode length {self.avg_episode_length:.0f} x {self.num_envs} envs)")
         if self.reward_sample_prob > 0.0:
             n_rewards = int((self.sparse_rewards[:valid, 0] >= self.reward_threshold).sum().item())
             print(f"  Reward Windows : p={self.reward_sample_prob} | "
                   f"{n_rewards} transitions with sparse reward >= {self.reward_threshold}")
+        if self.curiosity_sample_prob > 0.0:
+            n_cur = int((self.curiosities[:valid, 0] > 0).sum().item())
+            starts = "pending rebuild" if self._curiosity_dirty else f"{self._curiosity_starts.numel():,} pre-approved starts"
+            print(f"  Curiosity Windows : p={self.curiosity_sample_prob} | min {self.curiosity_window_min} "
+                  f"exploration steps/window | {n_cur:,} nonzero-curiosity transitions | {starts}")
         print("=" * 50 + "\n")
-
-
-# ==========================================================
-# BACKGROUND BATCH PREFETCHER
-# ==========================================================
-class BatchPrefetcher:
-    """Samples pinned CPU batches on a background thread so the gather overlaps GPU
-    training. Runs only during the training phase; episode collection happens
-    sequentially afterward, so no buffer writes occur while it samples."""
-
-    def __init__(self, buffer, batch_size, sequence_size, depth=3):
-        self.buffer = buffer
-        self.batch_size = batch_size
-        self.sequence_size = sequence_size
-        self._q = queue.Queue(maxsize=depth)
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        while not self._stop.is_set():
-            batch = self.buffer.sample(self.batch_size, self.sequence_size)
-            if batch is None:
-                time.sleep(0.01)
-                continue
-            # Block until there's room, but stay responsive to close().
-            while not self._stop.is_set():
-                try:
-                    self._q.put(batch, timeout=0.1)
-                    break
-                except queue.Full:
-                    continue
-
-    def get(self):
-        return self._q.get()
-
-    def close(self):
-        self._stop.set()
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
-        self._thread.join(timeout=1.0)
 
 
 # ==========================================================
@@ -801,13 +813,12 @@ class Dreamer:
                  team_dim=6, item_dim=2, curiosity_scale=0.25, mlp_dim=1024,
                  entropy_scale=0.0015,
                  teamitem_out=128, ltm_reward_out=512, grid_out=128,
-                 dream_lead_steps=10, ltm_gate_threshold=0.4, grid_gate_threshold=0.5,
                  grid_zero_weight=5.0,
                  var_beta_dyn=0.5, var_beta_reg=0.1, var_warmup_steps=20000,
-                 loss_norm_decay=0.99, reward_loss_weight=1.0,
                  continue_discount=0.998, pmpo_alpha=0.5,
                  reward_sample_prob=0.0, reward_threshold=50.0,
-                 recent_sample_prob=0.0):
+                 recent_sample_prob=0.0,
+                 curiosity_sample_prob=0.0, curiosity_window_min=8):
 
         # --- Dimensions / config ---
         self.device = device
@@ -852,11 +863,6 @@ class Dreamer:
         # (non-zero) curiosity so the head is punished more for missing them.
         self.curiosity_pos_weight = 5.0
 
-        self.dream_lead_steps = dream_lead_steps
-
-        # Dream sparse-reward curiosity gating
-        self.ltm_gate_threshold = ltm_gate_threshold
-        self.grid_gate_threshold = grid_gate_threshold
         self.grid_zero_weight = grid_zero_weight
 
         # --- Encodings ---
@@ -895,7 +901,6 @@ class Dreamer:
         self.var_beta_dyn = var_beta_dyn
         self.var_beta_reg = var_beta_reg
         self.var_warmup_steps = var_warmup_steps  # gated on total_num_updates (persisted in checkpoints)
-        self.reward_loss_weight = reward_loss_weight
         self.continue_discount = continue_discount
 
         # --- Buffer ---
@@ -906,6 +911,7 @@ class Dreamer:
             num_envs=len(envs), grid_dim=GRID_DIM,
             reward_sample_prob=reward_sample_prob, reward_threshold=reward_threshold,
             recent_sample_prob=recent_sample_prob,
+            curiosity_sample_prob=curiosity_sample_prob, curiosity_window_min=curiosity_window_min,
         )
 
         # --- World-model parameter group ---
@@ -938,10 +944,10 @@ class Dreamer:
         return self._batch_to_device(self.buffer.sample(batchSize, sequenceSize))
 
     def _batch_to_device(self, cpu_batch):
-        """Move a pinned CPU batch to the device (non_blocking) and apply dtype conversions."""
+        """Move a CPU batch to the device and apply dtype conversions."""
         if cpu_batch is None:
             return None
-        out = {k: v.to(self.device, non_blocking=True) for k, v in cpu_batch.items()}
+        out = {k: v.to(self.device) for k, v in cpu_batch.items()}
         out["observations"] = out["observations"].float() / 255.0
         out["ltm_rewards"] = out["ltm_rewards"].float()
         out["grids"] = out["grids"].float()
@@ -1138,15 +1144,6 @@ class Dreamer:
         return full_states.view(-1, self.concatenated_dim).detach(), kv_context, metrics
 
     # -----------------------------------------------------
-    @staticmethod
-    def _newly_activated_mask(logits, threshold=0.5):
-        """Return a float mask [N, T] that is 1.0 at the first imagined step where any
-        LTM bit turns ON (sigmoid > threshold) after being OFF at all earlier steps."""
-        on = (torch.sigmoid(logits) > threshold)                       # [N, T, D] bool
-        prev_on = torch.cumsum(on.float(), dim=1) - on.float()         # # of ON steps before t
-        newly_on = on & (prev_on < 0.5)                                # on now, never on before
-        return newly_on.any(dim=-1).float()                            # [N, T]
-
     def Dream(self, full_state, horizon=15,
               compute_metrics=True, kv_context=None):
         self.actorOptimizer.zero_grad(set_to_none=True)
@@ -1211,14 +1208,7 @@ class Dreamer:
             predicted_standard = self.two_hot.decode(self.standardRewardPredictor(imagined_steps)).squeeze(-1)
             predicted_curiosity = self.two_hot.decode(self.curiosityPredictor(imagined_steps)).squeeze(-1)
 
-            # --- Anti-duplication gate  --
-            reward_ltm_logits = self.ltm_reward_predictor(imagined_steps)  # [N, T, D]
-            predicted_sparse = predicted_sparse  #* self._newly_activated_mask(reward_ltm_logits, self.ltm_gate_threshold)
             predicted_rewards = predicted_sparse + predicted_standard
-            grid_logits = self.grid_predictor(imagined_steps)             # [N, T, GRID_DIM]
-            center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
-            tile_gate = 1.0 - center_explored_prob
-            predicted_curiosity = predicted_curiosity #* tile_gate
 
         # --- Critic values (two-hot) ---
         imagined_states = full_states.detach()
@@ -1520,20 +1510,27 @@ class Dreamer:
         best_states_device = best_states.to(self.device)
         grid_logits = self.grid_predictor(best_states_device)
         center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
-        tile_gate = 1.0 - center_explored_prob  # soft gate (matches Dream)
+        tile_gate = 1.0 - center_explored_prob  # soft gate (display only; Dream uses ungated curiosity)
         curiosities = (
             self.two_hot.decode(self.curiosityPredictor(best_states_device)).squeeze(-1) * tile_gate
         ).cpu()
 
-        decoded_imgs = self.decoder(best_states_device).clamp(0.0, 1.0).cpu()  # [horizon, 3, 64, 64]
+        decoded_imgs = self.decoder(best_states_device).clamp(0.0, 1.0).cpu()  # [horizon, 3, 96, 96]
 
         horizon = best_states.shape[0]
         action_names = ["UP", "DOWN", "LEFT", "RIGHT", "A", "B"]
         action_icons = {"UP": "▲ UP", "DOWN": "▼ DN", "LEFT": "◀ LT", "RIGHT": "▶ RT", "A": "A", "B": "B"}
 
         # Taller info row + larger figure so the per-step numbers are easy to read.
-        fig, axes = plt.subplots(2, horizon, figsize=(horizon * 2.7, 7.5), facecolor='#0d1117', dpi=120,
-                                 gridspec_kw={'height_ratios': [1.4, 1.3]})
+        # PDF path: build the figure OUTSIDE pyplot's global registry (Figure(),
+        # not plt.subplots) so nothing keeps it alive after savefig -- pyplot
+        # figures leaked ~180 MB/episode via uncollected reference cycles.
+        if pdf is not None:
+            fig = MplFigure(figsize=(horizon * 2.7, 7.5), facecolor='#0d1117', dpi=120)
+            axes = fig.subplots(2, horizon, gridspec_kw={'height_ratios': [1.4, 1.3]})
+        else:
+            fig, axes = plt.subplots(2, horizon, figsize=(horizon * 2.7, 7.5), facecolor='#0d1117', dpi=120,
+                                     gridspec_kw={'height_ratios': [1.4, 1.3]})
         # Title: dream type + its (max) combined advantage.
         dream_type = label if label is not None else "Dream"
         adv_value = max_advantage
@@ -1590,10 +1587,10 @@ class Dreamer:
                              fontsize=15, fontweight='bold', color='#d1f1a5',
                              fontfamily='monospace', transform=ax_info.transAxes)
 
-        plt.subplots_adjust(top=0.90, bottom=0.04, hspace=0.12)
+        fig.subplots_adjust(top=0.90, bottom=0.04, hspace=0.12)
         # Save to the PdfPages handle if given, otherwise show interactively.
         if pdf is not None:
             pdf.savefig(fig, facecolor=fig.get_facecolor())
         else:
             plt.show()
-        plt.close(fig)
+            plt.close(fig)

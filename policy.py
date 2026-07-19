@@ -1,11 +1,12 @@
 import os
+import gc
 import csv
 import glob
 import random
 import numpy as np
 import torch
 
-from dreamer import Dreamer, BatchPrefetcher
+from dreamer import Dreamer
 
 
 class Policy:
@@ -31,10 +32,10 @@ class Policy:
         self.dreamer_config = dict(
         action_dim=self.action_dim,
         recurrent_dim=512,        # size of recurrent state (h) in TSSM
-        tssm_layers=6,             # 4 -> 8: depth helps long-range dynamics most
-        tssm_heads=4,              # head_dim=128 at d_model=1024 (leave as-is)
-        tssm_kv_heads=4,           # 4:1 GQA
-        tssm_ffn=1365,             # ~8/3 * 1024 (correct for this width)
+        tssm_layers=6,
+        tssm_heads=4,
+        tssm_kv_heads=4,
+        tssm_ffn=1365,             # approximately 8/3 * 512
         context_length=80,         
         rows=40, cols=40,
         number_of_sequences=64,    
@@ -48,13 +49,12 @@ class Policy:
         pmpo_alpha=0.5,
         entropy_scale=0.1,
         continue_discount=0.997,
-        dream_lead_steps=10,
-        ltm_gate_threshold=0.3,
-        grid_gate_threshold=0.1,
         grid_zero_weight=20.0,     # extra BCE cost for missing an unexplored grid cell
         reward_sample_prob=0.05,   # per-sequence chance the sampled window is forced to contain a big sparse reward
         reward_threshold=50.0,    # "big reward" cutoff for the guarantee above
-        recent_sample_prob=0.03,   # per-sequence chance to sample from the freshest num_envs episodes
+        recent_sample_prob=0.3,   # per-sequence chance to sample from the freshest num_envs episodes
+        curiosity_sample_prob=0.2,  # per-sequence chance the window comes from a pre-approved exploration-heavy start
+        curiosity_window_min=8,     # window qualifies with >= this many new-tile (nonzero curiosity) steps
     )
 
         self.visualize_dreams = visualize_dreams
@@ -113,36 +113,27 @@ class Policy:
             random_dreams_of_episode = []
             wm_metrics = {}
 
-            prefetcher = BatchPrefetcher(
-                self.dreamer.buffer,
-                batch_size=self.dreamer.number_of_sequences,
-                sequence_size=self.dreamer.steps_per_sequence,
-            )
-            try:
-                for step in range(self.training_per_episodes):
-                    if step % 50 == 0:
-                        print(f"    [Training] Step {step} / {self.training_per_episodes}")
-                    # Batch already sampled+pinned in the background; just move it to the GPU.
-                    sample = self.dreamer._batch_to_device(prefetcher.get())
+            for step in range(self.training_per_episodes):
+                if step % 50 == 0:
+                    print(f"    [Training] Step {step} / {self.training_per_episodes}")
+                sample = self.dreamer.sample_batch(
+                    self.dreamer.number_of_sequences, self.dreamer.steps_per_sequence)
 
-                    # Only the last (logged) step needs the sync-heavy .item() metric pulls.
-                    compute_metrics = (step == self.training_per_episodes - 1)
+                # Only the last (logged) step needs the sync-heavy .item() metric pulls.
+                compute_metrics = (step == self.training_per_episodes - 1)
 
-                    # Update Networks
-                    full_states, kv_context, wm_metrics = self.dreamer.TrainWorldModel(
-                        sample, compute_metrics=compute_metrics)
-                    # Two dreams: max combined-advantage and a random one.
-                    dream_metrics, best_dream, rand_dream = self.dreamer.Dream(
-                        full_states, horizon=self.dream_horizon,
-                        compute_metrics=compute_metrics,
-                        kv_context=kv_context,
-                    )
+                full_states, kv_context, wm_metrics = self.dreamer.TrainWorldModel(
+                    sample, compute_metrics=compute_metrics)
+                # Two dreams: max combined-advantage and a random one.
+                dream_metrics, best_dream, rand_dream = self.dreamer.Dream(
+                    full_states, horizon=self.dream_horizon,
+                    compute_metrics=compute_metrics,
+                    kv_context=kv_context,
+                )
 
-                    best_dreams_of_episode.append(best_dream)
-                    random_dreams_of_episode.append(rand_dream)
-                    self.dreamer.total_num_updates += 1
-            finally:
-                prefetcher.close()
+                best_dreams_of_episode.append(best_dream)
+                random_dreams_of_episode.append(rand_dream)
+                self.dreamer.total_num_updates += 1
 
             if self.visualize_dreams:
                 best_dreams_of_episode.sort(key=lambda x: x[0], reverse=True)
@@ -154,14 +145,11 @@ class Policy:
 
                 dreams_to_visualize = vis_best + vis_rand
 
-                # Print a quick summary
                 best_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_best])
                 rand_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_rand])
                 print(f"[*] Saving {len(vis_best)} MAX ADVANTAGE Dreams (Combined Advs: [{best_adv_str}])")
                 print(f"[*] Saving {len(vis_rand)} RANDOM Dreams (Combined Advs: [{rand_adv_str}])")
 
-                # --- Save this training phase's dreams to a single file in dreams/ ---
-                # Keep at most 10 dream files; the oldest is replaced first.
                 dream_path = self._save_dreams_to_file(dreams_to_visualize)
                 print(f"[*] Saved {len(dreams_to_visualize)} dreams to {dream_path}")
             # --- Play one episode with the freshly updated policy ---
@@ -169,8 +157,7 @@ class Policy:
             avg_score, avg_curiosity = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
 
             self.dreamer.buffer.print_diagnostics()
-            
-            # Print cleanly formatted metrics
+
             print(f"    > Total Env Steps : {self.dreamer.total_num_steps}")
             print(f"    > Gradient Steps  : {self.dreamer.total_num_updates}")
             print(f"    > Total Reward    : {avg_score:.2f}")
@@ -259,6 +246,9 @@ class Policy:
                     pdf=pdf,
                 )
 
+        # Sweep matplotlib's reference cycles now; left to the GC they leak.
+        gc.collect()
+
         # --- Rotation: keep only the 10 most recent dream files ---
         existing = sorted(
             glob.glob(os.path.join(dreams_dir, "*.pdf")),
@@ -274,7 +264,7 @@ class Policy:
         return file_path
 
     def evaluate(self, num_episodes=1):
-        """ Evaluates BOTH agents simultaneously """
+        """Evaluate all parallel envs simultaneously with the loaded policy."""
         self.dreamer.loadCheckpoints()
         print(f"Starting Parallel Evaluation for {num_episodes} episodes per agent...")
         
@@ -362,4 +352,4 @@ class Policy:
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True   # your input shapes are fixed (64x64), so autotuning pays off
+        torch.backends.cudnn.benchmark = True   # input shapes are fixed, so autotuning pays off

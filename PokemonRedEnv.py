@@ -132,7 +132,7 @@ class PokemonRedEnv(gym.Env):
     RAM_BAG_ITEMS_BASE = 0xD31E
     ITEM_POKEBALL = 0x04
 
-    def __init__(self, rom_path, state_path, image_size=64, verbose=False, window="SDL2", speed=0):
+    def __init__(self, rom_path, state_path, image_size=96, verbose=False, window="SDL2", speed=0):
         super().__init__()
 
         self.state_path = state_path
@@ -563,7 +563,7 @@ class ParallelPokemonEnvs:
     """Runs each PyBoy emulator in its own process; step() dispatches all active
     commands before reading any reply, so the emulators advance in parallel."""
 
-    def __init__(self, num_envs, rom_path, state_path, image_size=64,
+    def __init__(self, num_envs, rom_path, state_path, image_size=96,
                  window="null", speed=0, verbose=False):
         ctx = mp.get_context("spawn")  # PyBoy is not fork-safe; spawn works on Windows too
         self.num_envs = num_envs
